@@ -4,6 +4,8 @@ Discovers models from OpenAI-compatible API endpoints and updates your [OpenCode
 
 Works with llama.cpp, llama-swap, LM Studio, vLLM, and any other server that exposes a `/v1/models` endpoint.
 
+![](screenshot.png)
+
 ## Requirements
 
 - [uv](https://docs.astral.sh/uv/) (dependencies are handled automatically via inline script metadata)
@@ -54,11 +56,13 @@ uv run opencode-model-tool.py --list --endpoint https://llamaswap.your.domain/v1
 1. Fetches models from the `/v1/models` endpoint
 2. Parses context length from model IDs (e.g. `128k` in `qwen3-5-27b-ud-q6kxl-128k-coding-thinking` becomes 131,072 tokens)
 3. Filters out embedding/reranker models by default
-4. Presents a split-pane TUI: model selection on the left, live config preview on the right
-5. Remembers your previous selections per endpoint -- new models appear at the top marked `[NEW]`, removed models are flagged with clear warnings
-6. Auto-detects your OpenCode config and matches the provider by `baseURL`, or derives the provider ID from the endpoint hostname
-7. Updates only the `"models"` block for the matched provider, preserving all other config including JSONC comments
-8. Creates a `.bak` backup before writing
+4. Presents a split-pane TUI: model checkboxes on the left, live config diff on the right
+5. Models already in your config are pre-selected; new endpoint models marked `[NEW]`; removed models flagged
+6. Press `/` to filter models by name, `space` to toggle, `a` to toggle all, `enter` to confirm, `q` to cancel
+7. Reads existing config to show a clear diff: which models are being added, kept, or removed
+8. Auto-detects your OpenCode config and matches the provider by `baseURL`, or derives the provider ID from the endpoint hostname
+9. Updates only the `"models"` block for the matched provider, preserving all other config including JSONC comments
+10. Creates a `.bak` backup before writing
 
 ## Config format
 
