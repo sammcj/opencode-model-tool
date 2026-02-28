@@ -149,6 +149,142 @@ def is_excluded(model_id: str) -> bool:
     return any(pat in lower for pat in EXCLUDED_PATTERNS)
 
 
+def _base_url(endpoint: str) -> str:
+    """Strip /v1 suffix to get the server base URL."""
+    norm = normalise_endpoint(endpoint)
+    if norm.endswith("/v1"):
+        return norm[:-3]
+    return norm
+
+
+def _auth_headers(api_key: str | None) -> dict[str, str]:
+    """Build auth headers from an optional API key."""
+    if api_key:
+        return {"Authorization": f"Bearer {api_key}"}
+    return {}
+
+
+def extract_context_from_model_data(model: dict) -> int | None:
+    """Extract context size from model API response data.
+
+    Checks fields used by different providers:
+    - meta.n_ctx_train (llama.cpp / llamaswap)
+    - context_length, max_model_len, context_window (other providers)
+    """
+    meta = model.get("meta")
+    if isinstance(meta, dict):
+        n_ctx = meta.get("n_ctx_train")
+        if isinstance(n_ctx, int) and n_ctx > 0:
+            return n_ctx
+
+    for key in ("context_length", "max_model_len", "context_window"):
+        val = model.get(key)
+        if isinstance(val, int) and val > 0:
+            return val
+
+    return None
+
+
+def fetch_model_info_context(
+    endpoint: str, api_key: str | None = None
+) -> dict[str, int]:
+    """Fetch model context sizes from /model/info (litellm).
+
+    Returns a dict mapping model ID to context size in tokens.
+    Silently returns an empty dict on any failure.
+    """
+    url = f"{normalise_endpoint(endpoint)}/model/info"
+    try:
+        resp = httpx.get(
+            url, headers=_auth_headers(api_key), timeout=10, follow_redirects=True
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception:
+        return {}
+
+    result: dict[str, int] = {}
+    for entry in data.get("data", []):
+        model_name = entry.get("model_name") or entry.get("id", "")
+        if not model_name:
+            continue
+        # litellm: model_info.max_input_tokens or model_info.max_tokens
+        model_info = entry.get("model_info", {})
+        if isinstance(model_info, dict):
+            ctx = model_info.get("max_input_tokens") or model_info.get("max_tokens")
+            if isinstance(ctx, int) and ctx > 0:
+                result[model_name] = ctx
+                continue
+        # Fallback to top-level fields (n_ctx_train, context_length, etc.)
+        ctx = extract_context_from_model_data(entry)
+        if ctx:
+            result[model_name] = ctx
+
+    return result
+
+
+def fetch_props_context(
+    endpoint: str, api_key: str | None = None
+) -> tuple[int | None, str]:
+    """Try GET /props on direct llama.cpp servers.
+
+    Returns (n_ctx, model_alias) or (None, "") on failure.
+    n_ctx is the per-slot runtime context size (max usable per request).
+    """
+    url = f"{_base_url(endpoint)}/props"
+    try:
+        resp = httpx.get(
+            url, headers=_auth_headers(api_key), timeout=10, follow_redirects=True
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception:
+        return None, ""
+
+    n_ctx = data.get("default_generation_settings", {}).get("n_ctx")
+    model_alias = data.get("model_alias", "")
+    if isinstance(n_ctx, int) and n_ctx > 0:
+        return n_ctx, model_alias
+    return None, ""
+
+
+def fetch_upstream_props_context(
+    endpoint: str,
+    model_ids: list[str],
+    api_key: str | None = None,
+) -> dict[str, int]:
+    """Fetch runtime context via llama-swap's /upstream/{model}/props passthrough.
+
+    Each call loads the model on the remote server, so this should only be
+    called after the user has confirmed their selection.
+
+    Returns dict mapping model ID -> runtime n_ctx (per-slot).
+    """
+    base = _base_url(endpoint)
+    headers = _auth_headers(api_key)
+
+    result: dict[str, int] = {}
+    for i, mid in enumerate(model_ids, 1):
+        print(f"  [{i}/{len(model_ids)}] {mid} ...", end="", flush=True)
+        url = f"{base}/upstream/{mid}/props"
+        try:
+            resp = httpx.get(url, headers=headers, timeout=60, follow_redirects=True)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception:
+            print(" failed")
+            continue
+
+        n_ctx = data.get("default_generation_settings", {}).get("n_ctx")
+        if isinstance(n_ctx, int) and n_ctx > 0:
+            result[mid] = n_ctx
+            print(f" {n_ctx:,} tokens")
+        else:
+            print(" no context info")
+
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Context length parsing
 # ---------------------------------------------------------------------------
@@ -171,9 +307,13 @@ def parse_context_from_id(model_id: str) -> int | None:
 def build_model_config(
     model_id: str,
     default_output: int = DEFAULT_OUTPUT_TOKENS,
+    api_context: int | None = None,
 ) -> dict:
-    """Build an OpenCode model config entry from a model ID."""
-    context = parse_context_from_id(model_id) or DEFAULT_CONTEXT_FALLBACK
+    """Build an OpenCode model config entry from a model ID.
+
+    Context priority: api_context > name parsing > DEFAULT_CONTEXT_FALLBACK.
+    """
+    context = api_context or parse_context_from_id(model_id) or DEFAULT_CONTEXT_FALLBACK
     output = min(default_output, context)
     return {
         "name": model_id,
@@ -582,6 +722,7 @@ class ModelSelectorApp(App[list[str] | None]):
         removed_selected: list[str],
         removed_other: list[str],
         default_output: int,
+        api_contexts: dict[str, int] | None = None,
     ) -> None:
         super().__init__()
         self._selections = selections
@@ -589,6 +730,7 @@ class ModelSelectorApp(App[list[str] | None]):
         self._removed_selected = removed_selected
         self._removed_other = removed_other
         self._default_output = default_output
+        self._api_contexts = api_contexts or {}
         # Ground truth for selection state (survives filter rebuilds)
         self._selected_ids: set[str] = {
             sel.value for sel in selections if sel.initial_state
@@ -668,7 +810,9 @@ class ModelSelectorApp(App[list[str] | None]):
         # Show config for newly added models only
         if adding:
             models = {
-                mid: build_model_config(mid, self._default_output)
+                mid: build_model_config(
+                    mid, self._default_output, self._api_contexts.get(mid)
+                )
                 for mid in adding
             }
             lines.append("[bold green]Adding to config:[/bold green]")
@@ -767,10 +911,15 @@ def categorise_models(
     return new, in_config, available, gone_configured, gone_other
 
 
-def _make_label(mid: str, prefix: str = "") -> Text:
+def _make_label(
+    mid: str, prefix: str = "", api_context: int | None = None
+) -> Text:
     """Build a styled label for a model selection entry."""
-    ctx = parse_context_from_id(mid)
-    ctx_str = f" ({ctx // 1024}k ctx)" if ctx else ""
+    if api_context:
+        ctx_str = f" ({api_context // 1024}k ctx)"
+    else:
+        ctx = parse_context_from_id(mid)
+        ctx_str = f" (~{ctx // 1024}k ctx)" if ctx else ""
     label = Text(f"{prefix}{mid}{ctx_str}")
     if prefix:
         label.stylize("bold green", 0, len(prefix))
@@ -782,6 +931,7 @@ def interactive_select(
     state_entry: dict,
     config_model_ids: set[str],
     default_output: int = DEFAULT_OUTPUT_TOKENS,
+    api_contexts: dict[str, int] | None = None,
 ) -> list[str] | None:
     """Show an interactive split-pane TUI for model selection.
 
@@ -790,24 +940,32 @@ def interactive_select(
 
     Returns selected model IDs, or None if cancelled.
     """
+    contexts = api_contexts or {}
     new, in_config, available, gone_configured, gone_other = (
         categorise_models(model_ids, state_entry, config_model_ids)
     )
 
     selections: list[Selection[str]] = []
     for mid in new:
-        selections.append(Selection(_make_label(mid, "[NEW] "), mid, False))
+        selections.append(
+            Selection(_make_label(mid, "[NEW] ", contexts.get(mid)), mid, False)
+        )
     for mid in in_config:
-        selections.append(Selection(_make_label(mid), mid, True))
+        selections.append(
+            Selection(_make_label(mid, api_context=contexts.get(mid)), mid, True)
+        )
     for mid in available:
-        selections.append(Selection(_make_label(mid), mid, False))
+        selections.append(
+            Selection(_make_label(mid, api_context=contexts.get(mid)), mid, False)
+        )
 
     if not selections:
         print("No models available for selection.")
         return []
 
     app = ModelSelectorApp(
-        selections, config_model_ids, gone_configured, gone_other, default_output
+        selections, config_model_ids, gone_configured, gone_other, default_output,
+        api_contexts=contexts,
     )
     return app.run()
 
@@ -848,6 +1006,40 @@ def main() -> None:
     all_ids = sorted(m["id"] for m in raw_models if "id" in m)
     print(f"Found {len(all_ids)} models.")
 
+    # Detect endpoint type for context size probing
+    owned_by_values = {m.get("owned_by", "").lower() for m in raw_models}
+    is_llama_swap = "llama-swap" in owned_by_values
+    is_direct_llamacpp = "llamacpp" in owned_by_values and not is_llama_swap
+
+    # --- Context size detection (lightweight probes, no model loading) ---
+    api_contexts: dict[str, int] = {}
+
+    # 1. Extract from /v1/models response data (free, already fetched)
+    for m in raw_models:
+        mid = m.get("id", "")
+        ctx = extract_context_from_model_data(m)
+        if mid and ctx:
+            api_contexts[mid] = ctx
+
+    # 2. Try /props (direct llama.cpp - returns runtime context for loaded model)
+    props_ctx, props_alias = fetch_props_context(endpoint, api_key)
+    if props_ctx:
+        matched = False
+        for mid in all_ids:
+            if mid == props_alias or mid.lower() == props_alias.lower():
+                api_contexts[mid] = props_ctx
+                matched = True
+                break
+        if not matched and len(all_ids) == 1:
+            api_contexts[all_ids[0]] = props_ctx
+
+    # 3. Try /model/info (litellm proxy)
+    info_contexts = fetch_model_info_context(endpoint, api_key)
+    api_contexts.update(info_contexts)
+
+    if api_contexts:
+        print(f"Detected context size for {len(api_contexts)} model(s) from API.")
+
     # Filter out embeddings/rerankers unless requested
     if args.include_embeddings:
         model_ids = all_ids
@@ -868,9 +1060,13 @@ def main() -> None:
     if args.list_only:
         print(f"\nAvailable models ({len(model_ids)}):\n")
         for mid in model_ids:
-            ctx = parse_context_from_id(mid)
-            ctx_str = f"  context: {ctx:,}" if ctx else "  context: unknown"
-            print(f"  {mid}{ctx_str}")
+            api_ctx = api_contexts.get(mid)
+            if api_ctx:
+                print(f"  {mid}  context: {api_ctx:,}")
+            else:
+                name_ctx = parse_context_from_id(mid)
+                ctx_str = f"  context: ~{name_ctx:,} (from name)" if name_ctx else "  context: unknown"
+                print(f"  {mid}{ctx_str}")
         return
 
     # Parse config early so we know what's already configured
@@ -915,7 +1111,8 @@ def main() -> None:
                 print(f"  x {mid}")
     else:
         selected = interactive_select(
-            model_ids, state_entry, config_model_ids, args.default_output
+            model_ids, state_entry, config_model_ids, args.default_output,
+            api_contexts=api_contexts,
         )
         if selected is None:
             print("Cancelled.")
@@ -925,10 +1122,49 @@ def main() -> None:
         print("No models selected.")
         return
 
+    # After selection: for llama-swap / direct llama.cpp endpoints, offer to
+    # query upstream props to get the actual runtime context size.
+    models_without_api_ctx = [mid for mid in selected if mid not in api_contexts]
+    if (is_llama_swap or is_direct_llamacpp) and models_without_api_ctx:
+        print(
+            f"\n{len(models_without_api_ctx)} model(s) don't have a known context size from the API."
+        )
+        print(
+            "The tool can query each model's runtime properties to get the actual "
+            "configured context size."
+        )
+        print(
+            "Note: this may take a minute as llama.cpp may need to partially load "
+            "each model to read its properties."
+        )
+        if args.yes:
+            fetch_upstream = True
+        else:
+            answer = input("Fetch context sizes from the server? [Y/n] ").strip().lower()
+            fetch_upstream = not answer or answer in ("y", "yes")
+
+        if fetch_upstream:
+            if is_llama_swap:
+                upstream_ctx = fetch_upstream_props_context(
+                    endpoint, models_without_api_ctx, api_key
+                )
+            else:
+                # Direct llama.cpp: /props applies to the single loaded model
+                upstream_ctx = {}
+                for mid in models_without_api_ctx:
+                    ctx, _ = fetch_props_context(endpoint, api_key)
+                    if ctx:
+                        upstream_ctx[mid] = ctx
+            api_contexts.update(upstream_ctx)
+        else:
+            print("Skipping - will use estimates from model names where available.")
+
     # Build model configs
     models_config = {}
     for mid in selected:
-        models_config[mid] = build_model_config(mid, args.default_output)
+        models_config[mid] = build_model_config(
+            mid, args.default_output, api_contexts.get(mid)
+        )
 
     if config_path is None:
         print("\nNo OpenCode config file found.")

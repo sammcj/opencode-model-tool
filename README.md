@@ -54,15 +54,20 @@ uv run opencode-model-tool.py --list --endpoint https://llamaswap.your.domain/v1
 ## What it does
 
 1. Fetches models from the `/v1/models` endpoint
-2. Parses context length from model IDs (e.g. `128k` in `qwen3-5-27b-ud-q6kxl-128k-coding-thinking` becomes 131,072 tokens)
-3. Filters out embedding/reranker models by default
-4. Presents a split-pane TUI: model checkboxes on the left, live config diff on the right
-5. Models already in your config are pre-selected; new endpoint models marked `[NEW]`; removed models flagged
-6. Press `/` to filter models by name, `space` to toggle, `a` to toggle all, `enter` to confirm, `q` to cancel
-7. Reads existing config to show a clear diff: which models are being added, kept, or removed
-8. Auto-detects your OpenCode config and matches the provider by `baseURL`, or derives the provider ID from the endpoint hostname
-9. Updates only the `"models"` block for the matched provider, preserving all other config including JSONC comments
-10. Creates a `.bak` backup before writing
+2. Probes several API endpoints for context size (before showing the TUI):
+   - `/v1/models` response metadata (`meta.n_ctx_train`, `context_length`, etc.)
+   - `/props` for direct llama.cpp servers (returns the actual runtime `n_ctx`)
+   - `/model/info` for litellm proxies (`model_info.max_input_tokens`)
+3. After you confirm your selection, for llama-swap endpoints it queries `/upstream/{model}/props` to get the actual configured runtime context size per model (this loads each model so it only happens post-confirmation)
+4. Falls back to parsing context from model names (e.g. `128k` in `qwen3-5-27b-128k`), then to a default of 8,192 tokens. API-detected context is shown as `(Xk ctx)`, name-estimated as `(~Xk ctx)`
+5. Filters out embedding/reranker models by default
+6. Presents a split-pane TUI: model checkboxes on the left, live config diff on the right
+7. Models already in your config are pre-selected; new endpoint models marked `[NEW]`; removed models flagged
+8. Press `/` to filter models by name, `space` to toggle, `a` to toggle all, `enter` to confirm, `q` to cancel
+9. Reads existing config to show a clear diff: which models are being added, kept, or removed
+10. Auto-detects your OpenCode config and matches the provider by `baseURL`, or derives the provider ID from the endpoint hostname
+11. Updates only the `"models"` block for the matched provider, preserving all other config including JSONC comments
+12. Creates a `.bak` backup before writing
 
 ## Config format
 
