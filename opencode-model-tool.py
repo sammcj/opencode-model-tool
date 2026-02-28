@@ -536,6 +536,7 @@ class ModelList(SelectionList[str]):
         Binding("a", "toggle_all_models", "Toggle all", priority=True),
         Binding("q", "request_cancel", "Quit", priority=True),
         Binding("escape", "request_cancel", show=False, priority=True),
+        Binding("ctrl+c", "request_cancel", show=False, priority=True),
     ]
 
     def action_confirm(self) -> None:
@@ -568,9 +569,10 @@ class ModelSelectorApp(App[list[str] | None]):
     #preview { padding: 1 2; }
     """
 
-    # Fallback escape for when search Input is focused
+    # Fallback bindings for when search Input is focused
     BINDINGS = [
         Binding("escape", "escape_fallback", show=False),
+        Binding("ctrl+c", "escape_fallback", show=False),
     ]
 
     def __init__(
@@ -587,12 +589,18 @@ class ModelSelectorApp(App[list[str] | None]):
         self._removed_selected = removed_selected
         self._removed_other = removed_other
         self._default_output = default_output
+        # Ground truth for selection state (survives filter rebuilds)
+        self._selected_ids: set[str] = {
+            sel.value for sel in selections if sel.initial_state
+        }
+        self._current_filter = ""
+        self._rebuilding = False
 
     def compose(self) -> ComposeResult:
         yield Header()
         with Horizontal(id="main"):
             with Vertical(id="left-panel"):
-                yield Input(placeholder="Type to search...", id="search")
+                yield Input(placeholder="Type to filter...", id="search")
                 yield ModelList(*self._selections, id="model-list")
             with VerticalScroll(id="preview-scroll"):
                 yield Static("", id="preview")
@@ -605,11 +613,39 @@ class ModelSelectorApp(App[list[str] | None]):
     def on_selection_list_selection_toggled(
         self, event: SelectionList.SelectionToggled
     ) -> None:
+        if self._rebuilding:
+            return
+        # Sync ground truth with visible widget state
+        ml = self.query_one("#model-list", ModelList)
+        visible_selected = set(ml.selected)
+        visible_ids = {
+            sel.value for sel in self._selections
+            if not self._current_filter
+            or self._current_filter in sel.value.lower()
+        }
+        for vid in visible_ids:
+            if vid in visible_selected:
+                self._selected_ids.add(vid)
+            else:
+                self._selected_ids.discard(vid)
+        self._update_preview()
+
+    def _rebuild_list(self, filter_query: str = "") -> None:
+        """Clear and repopulate the list, showing only matching items."""
+        self._rebuilding = True
+        self._current_filter = filter_query
+        ml = self.query_one("#model-list", ModelList)
+        ml.clear_options()
+        for sel in self._selections:
+            if filter_query and filter_query not in sel.value.lower():
+                continue
+            is_selected = sel.value in self._selected_ids
+            ml.add_option(Selection(sel.prompt, sel.value, is_selected))
+        self._rebuilding = False
         self._update_preview()
 
     def _update_preview(self) -> None:
-        sl = self.query_one("#model-list", ModelList)
-        current = set(sl.selected)
+        current = self._selected_ids
         prev = self._previously_selected
 
         adding = sorted(current - prev)
@@ -667,7 +703,7 @@ class ModelSelectorApp(App[list[str] | None]):
         self.query_one("#preview", Static).update("\n".join(lines))
 
     def on_model_list_confirmed(self) -> None:
-        self.exit(list(self.query_one("#model-list", ModelList).selected))
+        self.exit(sorted(self._selected_ids))
 
     def on_model_list_search_requested(self) -> None:
         search = self.query_one("#search", Input)
@@ -682,22 +718,17 @@ class ModelSelectorApp(App[list[str] | None]):
         self.exit(None)
 
     def on_input_changed(self, event: Input.Changed) -> None:
-        query = event.value.lower()
-        if not query:
-            return
-        ml = self.query_one("#model-list", ModelList)
-        for idx, sel in enumerate(self._selections):
-            if query in sel.value.lower():
-                ml.highlighted = idx
-                break
+        self._rebuild_list(event.value.strip().lower())
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
-        self._close_search()
+        """Enter in search bar: keep filter active, return focus to list."""
+        self.query_one("#model-list", ModelList).focus()
 
     def _close_search(self) -> None:
         search = self.query_one("#search", Input)
         search.display = False
         search.value = ""
+        self._rebuild_list()  # Restore full list
         self.query_one("#model-list", ModelList).focus()
 
     def action_escape_fallback(self) -> None:
