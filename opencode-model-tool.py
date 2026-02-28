@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["json5", "httpx", "InquirerPy"]
+# dependencies = ["json5", "httpx", "textual"]
 # ///
 """opencode-model-tool: Discover and configure local LLM models for OpenCode.
 
@@ -27,9 +27,13 @@ from urllib.parse import urlparse
 
 import httpx
 import json5
-from InquirerPy import inquirer
-from InquirerPy.base.control import Choice
-from InquirerPy.separator import Separator
+from rich.text import Text
+from textual.app import App, ComposeResult
+from textual.message import Message
+from textual.binding import Binding
+from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.widgets import Footer, Header, Input, SelectionList, Static
+from textual.widgets.selection_list import Selection
 
 # Models that are not useful for OpenCode (embeddings, rerankers, etc.)
 EXCLUDED_PATTERNS = ("embedding", "reranker", "embed", "minilm", "rerank")
@@ -233,6 +237,12 @@ def detect_provider_id(config_data: dict, endpoint: str) -> str | None:
     return None
 
 
+def read_config_model_ids(config_data: dict, provider_id: str) -> set[str]:
+    """Read model IDs currently configured for a provider."""
+    provider = config_data.get("provider", {}).get(provider_id, {})
+    return set(provider.get("models", {}).keys())
+
+
 def find_provider_section_span(text: str) -> tuple[int, int] | None:
     """Find the span of the top-level 'provider' object value in the config.
 
@@ -416,6 +426,7 @@ def update_config_models(
     provider_id: str,
     models: dict,
     endpoint: str,
+    existing_model_ids: set[str] | None = None,
     api_key_env: str | None = None,
     skip_confirm: bool = False,
 ) -> bool:
@@ -441,8 +452,7 @@ def update_config_models(
         prov_brace_start, prov_brace_end = prov_span
 
         # Insert new provider before the closing brace
-        # Derive display name from provider_id
-        display_name = provider_id.replace("_", " ").replace("-", " ").title()
+        display_name = provider_id
         new_block = build_new_provider_block(
             provider_id, display_name, endpoint, models, api_key_env
         )
@@ -450,33 +460,46 @@ def update_config_models(
         # Check if there's content before the closing brace (need a comma)
         before_close = text[prov_brace_start + 1 : prov_brace_end].rstrip()
         if before_close and not before_close.endswith(","):
-            # Add a trailing comma after the last provider
             last_content_pos = prov_brace_start + 1 + len(
                 text[prov_brace_start + 1 : prov_brace_end].rstrip()
             )
             text = text[:last_content_pos] + "," + text[last_content_pos:]
-            # Recalculate prov_brace_end since we inserted a character
             prov_brace_end += 1
 
         new_text = text[:prov_brace_end] + "\n" + new_block + ",\n  " + text[prov_brace_end:]
 
-    # Show diff
+    # Show diff relative to what's currently in config
+    existing = existing_model_ids or set()
+    selected = set(models.keys())
+    adding = sorted(selected - existing)
+    keeping = sorted(selected & existing)
+    removing = sorted(existing - selected)
+
     print("\n--- Changes to apply ---")
     if span is not None:
         print(f"Updating models for provider '{provider_id}' in {config_path}")
     else:
         print(f"Adding new provider '{provider_id}' to {config_path}")
-    print(f"Models: {len(models)}")
-    for mid in sorted(models):
-        ctx = models[mid]["limit"]["context"]
-        print(f"  {mid} (context: {ctx:,})")
+
+    if adding:
+        print(f"\n  Adding {len(adding)} model(s):")
+        for mid in adding:
+            ctx = models[mid]["limit"]["context"]
+            print(f"    + {mid} (context: {ctx:,})")
+    if keeping:
+        print(f"\n  Keeping {len(keeping)} model(s):")
+        for mid in keeping:
+            ctx = models[mid]["limit"]["context"]
+            print(f"    = {mid} (context: {ctx:,})")
+    if removing:
+        print(f"\n  Removing {len(removing)} model(s):")
+        for mid in removing:
+            print(f"    - {mid}")
     print()
 
     if not skip_confirm:
-        proceed = inquirer.confirm(
-            message="Apply these changes?", default=True
-        ).execute()
-        if not proceed:
+        answer = input("Apply these changes? [Y/n] ").strip().lower()
+        if answer and answer not in ("y", "yes"):
             print("Cancelled.")
             return False
 
@@ -495,75 +518,267 @@ def update_config_models(
 # ---------------------------------------------------------------------------
 
 
+class ModelList(SelectionList[str]):
+    """SelectionList with custom bindings that override type-ahead."""
+
+    class Confirmed(Message):
+        """Posted when the user presses Enter to confirm."""
+
+    class SearchRequested(Message):
+        """Posted when the user presses / to search."""
+
+    class CancelRequested(Message):
+        """Posted when the user presses q or Escape."""
+
+    BINDINGS = [
+        Binding("enter", "confirm", "Confirm", priority=True),
+        Binding("slash", "request_search", "Search", priority=True),
+        Binding("a", "toggle_all_models", "Toggle all", priority=True),
+        Binding("q", "request_cancel", "Quit", priority=True),
+        Binding("escape", "request_cancel", show=False, priority=True),
+    ]
+
+    def action_confirm(self) -> None:
+        self.post_message(self.Confirmed())
+
+    def action_request_search(self) -> None:
+        self.post_message(self.SearchRequested())
+
+    def action_toggle_all_models(self) -> None:
+        self.toggle_all()
+
+    def action_request_cancel(self) -> None:
+        self.post_message(self.CancelRequested())
+
+
+class ModelSelectorApp(App[list[str] | None]):
+    """Interactive model selector with live config preview."""
+
+    TITLE = "opencode-model-tool"
+
+    CSS = """
+    #main { height: 1fr; }
+    #left-panel { width: 1fr; }
+    #model-list { height: 1fr; }
+    #search { display: none; }
+    #preview-scroll {
+        width: 1fr;
+        border-left: thick $primary;
+    }
+    #preview { padding: 1 2; }
+    """
+
+    # Fallback escape for when search Input is focused
+    BINDINGS = [
+        Binding("escape", "escape_fallback", show=False),
+    ]
+
+    def __init__(
+        self,
+        selections: list[Selection[str]],
+        previously_selected: set[str],
+        removed_selected: list[str],
+        removed_other: list[str],
+        default_output: int,
+    ) -> None:
+        super().__init__()
+        self._selections = selections
+        self._previously_selected = previously_selected
+        self._removed_selected = removed_selected
+        self._removed_other = removed_other
+        self._default_output = default_output
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        with Horizontal(id="main"):
+            with Vertical(id="left-panel"):
+                yield Input(placeholder="Type to search...", id="search")
+                yield ModelList(*self._selections, id="model-list")
+            with VerticalScroll(id="preview-scroll"):
+                yield Static("", id="preview")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.query_one("#model-list", ModelList).focus()
+        self._update_preview()
+
+    def on_selection_list_selection_toggled(
+        self, event: SelectionList.SelectionToggled
+    ) -> None:
+        self._update_preview()
+
+    def _update_preview(self) -> None:
+        sl = self.query_one("#model-list", ModelList)
+        current = set(sl.selected)
+        prev = self._previously_selected
+
+        adding = sorted(current - prev)
+        keeping = sorted(current & prev)
+        dropping = sorted(prev - current)
+
+        lines: list[str] = []
+
+        # Summary
+        parts = []
+        if adding:
+            parts.append(f"[green]+{len(adding)} new[/green]")
+        if keeping:
+            parts.append(f"{len(keeping)} unchanged")
+        if dropping:
+            parts.append(f"[red]-{len(dropping)} removed[/red]")
+        summary = ", ".join(parts) if parts else "none"
+        lines.append(f"[bold]{len(current)} selected[/bold] ({summary})\n")
+
+        # Show config for newly added models only
+        if adding:
+            models = {
+                mid: build_model_config(mid, self._default_output)
+                for mid in adding
+            }
+            lines.append("[bold green]Adding to config:[/bold green]")
+            lines.append(format_models_json(models, indent=2))
+
+        # Show models being deselected (were in config, now unchecked)
+        if dropping:
+            lines.append("\n[bold yellow]Dropping from config (deselected):[/bold yellow]")
+            for mid in dropping:
+                lines.append(f"  [yellow]- {mid}[/yellow]")
+
+        # Models gone from the endpoint entirely
+        if self._removed_selected:
+            lines.append(
+                "\n[bold red]Gone from endpoint "
+                "(will be removed from config):[/bold red]"
+            )
+            for mid in self._removed_selected:
+                lines.append(f"  [red]x {mid}[/red]")
+
+        if self._removed_other:
+            lines.append(
+                "\n[dim]Also gone from endpoint (were not in config):[/dim]"
+            )
+            for mid in self._removed_other:
+                lines.append(f"  [dim]- {mid}[/dim]")
+
+        # Show unchanged as a collapsed count
+        if keeping:
+            lines.append(f"\n[dim]{len(keeping)} model(s) unchanged in config[/dim]")
+
+        self.query_one("#preview", Static).update("\n".join(lines))
+
+    def on_model_list_confirmed(self) -> None:
+        self.exit(list(self.query_one("#model-list", ModelList).selected))
+
+    def on_model_list_search_requested(self) -> None:
+        search = self.query_one("#search", Input)
+        if search.display:
+            self._close_search()
+        else:
+            search.display = True
+            search.value = ""
+            search.focus()
+
+    def on_model_list_cancel_requested(self) -> None:
+        self.exit(None)
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        query = event.value.lower()
+        if not query:
+            return
+        ml = self.query_one("#model-list", ModelList)
+        for idx, sel in enumerate(self._selections):
+            if query in sel.value.lower():
+                ml.highlighted = idx
+                break
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self._close_search()
+
+    def _close_search(self) -> None:
+        search = self.query_one("#search", Input)
+        search.display = False
+        search.value = ""
+        self.query_one("#model-list", ModelList).focus()
+
+    def action_escape_fallback(self) -> None:
+        """Handle escape when search Input is focused."""
+        search = self.query_one("#search", Input)
+        if search.display:
+            self._close_search()
+        else:
+            self.exit(None)
+
+
 def categorise_models(
     model_ids: list[str],
     state_entry: dict,
-) -> tuple[list[str], list[str], list[str], list[str]]:
-    """Categorise models into new, previously_selected, available, removed.
+    config_model_ids: set[str],
+) -> tuple[list[str], list[str], list[str], list[str], list[str]]:
+    """Categorise models relative to state and current config.
 
-    Returns (new, previously_selected, available, removed).
+    Returns (new, in_config, available, gone_configured, gone_other).
+    - new: on endpoint, never seen in state before, not already in config.
+    - in_config: on endpoint AND currently in the config file.
+    - available: on endpoint, not new, not in config.
+    - gone_configured: in config but no longer on the endpoint.
+    - gone_other: was known in state, not on endpoint, not in config.
     """
     known = set(state_entry.get("known", []))
-    selected = set(state_entry.get("selected", []))
-
     current = set(model_ids)
-    new = sorted(current - known)
-    previously_selected = sorted(current & selected)
-    available = sorted(current - set(new) - selected)
-    removed = sorted(known - current)
+    config = config_model_ids
 
-    return new, previously_selected, available, removed
+    new = sorted(current - known - config)
+    in_config = sorted(current & config)
+    available = sorted(current - set(new) - config)
+    gone_configured = sorted(config - current)
+    gone_other = sorted((known - current) - config)
+
+    return new, in_config, available, gone_configured, gone_other
+
+
+def _make_label(mid: str, prefix: str = "") -> Text:
+    """Build a styled label for a model selection entry."""
+    ctx = parse_context_from_id(mid)
+    ctx_str = f" ({ctx // 1024}k ctx)" if ctx else ""
+    label = Text(f"{prefix}{mid}{ctx_str}")
+    if prefix:
+        label.stylize("bold green", 0, len(prefix))
+    return label
 
 
 def interactive_select(
     model_ids: list[str],
     state_entry: dict,
-) -> list[str]:
-    """Show an interactive multi-select checkbox for model selection."""
-    new, previously_selected, available, removed = categorise_models(
-        model_ids, state_entry
+    config_model_ids: set[str],
+    default_output: int = DEFAULT_OUTPUT_TOKENS,
+) -> list[str] | None:
+    """Show an interactive split-pane TUI for model selection.
+
+    Left pane: checkbox list of models (new, in config, available).
+    Right pane: live diff showing adds/removes relative to current config.
+
+    Returns selected model IDs, or None if cancelled.
+    """
+    new, in_config, available, gone_configured, gone_other = (
+        categorise_models(model_ids, state_entry, config_model_ids)
     )
 
-    if removed:
-        print(f"\nRemoved from endpoint since last run: {', '.join(removed)}")
+    selections: list[Selection[str]] = []
+    for mid in new:
+        selections.append(Selection(_make_label(mid, "[NEW] "), mid, False))
+    for mid in in_config:
+        selections.append(Selection(_make_label(mid), mid, True))
+    for mid in available:
+        selections.append(Selection(_make_label(mid), mid, False))
 
-    choices: list[Choice | Separator] = []
-
-    if new:
-        choices.append(Separator("--- New models ---"))
-        for mid in new:
-            ctx = parse_context_from_id(mid)
-            ctx_str = f" ({ctx // 1024}k ctx)" if ctx else ""
-            choices.append(Choice(mid, name=f"[NEW] {mid}{ctx_str}", enabled=False))
-
-    if previously_selected:
-        choices.append(Separator("--- Previously selected ---"))
-        for mid in previously_selected:
-            ctx = parse_context_from_id(mid)
-            ctx_str = f" ({ctx // 1024}k ctx)" if ctx else ""
-            choices.append(Choice(mid, name=f"{mid}{ctx_str}", enabled=True))
-
-    if available:
-        choices.append(Separator("--- Available ---"))
-        for mid in available:
-            ctx = parse_context_from_id(mid)
-            ctx_str = f" ({ctx // 1024}k ctx)" if ctx else ""
-            choices.append(Choice(mid, name=f"{mid}{ctx_str}", enabled=False))
-
-    if not choices:
+    if not selections:
         print("No models available for selection.")
         return []
 
-    print(f"\n{len(model_ids)} models available. Use space to toggle, enter to confirm.\n")
-
-    selected = inquirer.checkbox(
-        message="Select models to add to OpenCode config:",
-        choices=choices,
-        cycle=True,
-        instruction="(space: toggle, a: toggle all, enter: confirm)",
-    ).execute()
-
-    return selected or []
+    app = ModelSelectorApp(
+        selections, config_model_ids, gone_configured, gone_other, default_output
+    )
+    return app.run()
 
 
 # ---------------------------------------------------------------------------
@@ -627,6 +842,31 @@ def main() -> None:
             print(f"  {mid}{ctx_str}")
         return
 
+    # Parse config early so we know what's already configured
+    if args.config:
+        config_path: Path | None = Path(args.config).expanduser()
+        if not config_path.exists():
+            print(f"Error: Config file not found: {config_path}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        config_path = find_config()
+
+    config_data = None
+    provider_id = None
+    config_model_ids: set[str] = set()
+
+    if config_path is not None:
+        try:
+            config_data = json5.loads(config_path.read_text())
+        except Exception as exc:
+            print(f"Error parsing config: {exc}", file=sys.stderr)
+            sys.exit(1)
+        provider_id = args.provider_id or detect_provider_id(config_data, endpoint)
+        if provider_id:
+            config_model_ids = read_config_model_ids(config_data, provider_id)
+            if config_model_ids:
+                print(f"Found {len(config_model_ids)} existing model(s) for provider '{provider_id}'.")
+
     # Load state
     state = load_state()
     state_entry = state.get(endpoint, {})
@@ -634,9 +874,21 @@ def main() -> None:
     # Model selection
     if args.all:
         selected = model_ids
+        _, _, _, gone_configured, _ = categorise_models(
+            model_ids, state_entry, config_model_ids
+        )
         print(f"\nSelected all {len(selected)} models.")
+        if gone_configured:
+            print("\nRemoved from endpoint (will be removed from config):")
+            for mid in gone_configured:
+                print(f"  x {mid}")
     else:
-        selected = interactive_select(model_ids, state_entry)
+        selected = interactive_select(
+            model_ids, state_entry, config_model_ids, args.default_output
+        )
+        if selected is None:
+            print("Cancelled.")
+            return
 
     if not selected:
         print("No models selected.")
@@ -647,20 +899,10 @@ def main() -> None:
     for mid in selected:
         models_config[mid] = build_model_config(mid, args.default_output)
 
-    # Find and update config
-    if args.config:
-        config_path = Path(args.config).expanduser()
-        if not config_path.exists():
-            print(f"Error: Config file not found: {config_path}", file=sys.stderr)
-            sys.exit(1)
-    else:
-        config_path = find_config()
-
     if config_path is None:
         print("\nNo OpenCode config file found.")
         print("Generated config snippet for your provider:\n")
         print(json.dumps(models_config, indent=2))
-        # Save state even without config so selections persist
         state[endpoint] = {
             "selected": sorted(selected),
             "known": sorted(model_ids),
@@ -670,17 +912,8 @@ def main() -> None:
 
     print(f"\nUsing config: {config_path}")
 
-    # Parse config to detect provider
-    try:
-        config_data = json5.loads(config_path.read_text())
-    except Exception as exc:
-        print(f"Error parsing config: {exc}", file=sys.stderr)
-        sys.exit(1)
-
-    provider_id = args.provider_id or detect_provider_id(config_data, endpoint)
-
+    # Prompt for provider_id if not yet resolved (new provider)
     if provider_id is None:
-        # Derive a sensible default provider ID from the URL
         parsed_url = urlparse(endpoint)
         hostname = parsed_url.hostname or "local"
         default_id = hostname.split(".")[0].replace("-", "_")
@@ -688,23 +921,21 @@ def main() -> None:
             default_id = "local_llm"
 
         if args.yes:
-            # Non-interactive mode: use the default
             provider_id = default_id
             print(f"Auto-assigned provider ID: {provider_id}")
         else:
-            provider_id = inquirer.text(
-                message="No existing provider found for this endpoint. Enter a provider ID:",
-                default=default_id,
-            ).execute()
+            provider_id = input(
+                f"No existing provider found. Enter a provider ID [{default_id}]: "
+            ).strip()
             if not provider_id:
-                print("No provider ID given. Aborting.")
-                return
+                provider_id = default_id
 
     updated = update_config_models(
         config_path,
         provider_id,
         models_config,
         endpoint,
+        existing_model_ids=config_model_ids,
         api_key_env=args.api_key_env,
         skip_confirm=args.yes,
     )
