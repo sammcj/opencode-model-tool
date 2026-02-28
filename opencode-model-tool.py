@@ -1124,7 +1124,8 @@ def main() -> None:
 
     # After selection: for llama-swap / direct llama.cpp endpoints, offer to
     # query upstream props to get the actual runtime context size.
-    models_without_api_ctx = [mid for mid in selected if mid not in api_contexts]
+    newly_added = [mid for mid in selected if mid not in config_model_ids]
+    models_without_api_ctx = [mid for mid in newly_added if mid not in api_contexts]
     if (is_llama_swap or is_direct_llamacpp) and models_without_api_ctx:
         print(
             f"\n{len(models_without_api_ctx)} model(s) don't have a known context size from the API."
