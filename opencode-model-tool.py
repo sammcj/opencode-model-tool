@@ -40,7 +40,7 @@ EXCLUDED_PATTERNS = ("embedding", "reranker", "embed", "minilm", "rerank")
 EXCLUDED_EXACT = ("llamacpp",)
 
 DEFAULT_OUTPUT_TOKENS = 65536
-DEFAULT_CONTEXT_FALLBACK = 8192
+DEFAULT_CONTEXT_FALLBACK = 192000  # 192k - suggested when prompting the user
 STATE_FILENAME = ".opencode-models-state.json"
 
 
@@ -185,13 +185,27 @@ def extract_context_from_model_data(model: dict) -> int | None:
     return None
 
 
-def fetch_model_info_context(
-    endpoint: str, api_key: str | None = None
-) -> dict[str, int]:
-    """Fetch model context sizes from /model/info (litellm).
+def extract_output_from_model_data(model: dict) -> int | None:
+    """Extract max output tokens from model API response data.
 
-    Returns a dict mapping model ID to context size in tokens.
-    Silently returns an empty dict on any failure.
+    Checks fields used by different providers:
+    - max_output_tokens, max_completion_tokens (OpenAI-style)
+    """
+    for key in ("max_output_tokens", "max_completion_tokens"):
+        val = model.get(key)
+        if isinstance(val, int) and val > 0:
+            return val
+
+    return None
+
+
+def fetch_model_info_limits(
+    endpoint: str, api_key: str | None = None
+) -> tuple[dict[str, int], dict[str, int]]:
+    """Fetch model context and output sizes from /model/info (litellm).
+
+    Returns (contexts, outputs) dicts mapping model ID to token counts.
+    Silently returns empty dicts on any failure.
     """
     url = f"{normalise_endpoint(endpoint)}/model/info"
     try:
@@ -201,35 +215,65 @@ def fetch_model_info_context(
         resp.raise_for_status()
         data = resp.json()
     except Exception:
-        return {}
+        return {}, {}
 
-    result: dict[str, int] = {}
+    contexts: dict[str, int] = {}
+    outputs: dict[str, int] = {}
     for entry in data.get("data", []):
         model_name = entry.get("model_name") or entry.get("id", "")
         if not model_name:
             continue
-        # litellm: model_info.max_input_tokens or model_info.max_tokens
         model_info = entry.get("model_info", {})
         if isinstance(model_info, dict):
+            # litellm: model_info.max_input_tokens or model_info.max_tokens
             ctx = model_info.get("max_input_tokens") or model_info.get("max_tokens")
             if isinstance(ctx, int) and ctx > 0:
-                result[model_name] = ctx
+                contexts[model_name] = ctx
+            # litellm: model_info.max_output_tokens
+            out = model_info.get("max_output_tokens")
+            if isinstance(out, int) and out > 0:
+                outputs[model_name] = out
+            if model_name in contexts:
                 continue
         # Fallback to top-level fields (n_ctx_train, context_length, etc.)
         ctx = extract_context_from_model_data(entry)
         if ctx:
-            result[model_name] = ctx
+            contexts[model_name] = ctx
 
-    return result
+    return contexts, outputs
 
 
-def fetch_props_context(
+def _parse_props_response(data: dict) -> tuple[int | None, int | None, str]:
+    """Parse a llama.cpp /props response.
+
+    Returns (n_ctx, n_predict, model_alias).
+    n_ctx is the per-slot runtime context (max usable per request).
+    n_predict is the server's max generation length (-1 means unlimited).
+    """
+    gen_settings = data.get("default_generation_settings")
+    if not isinstance(gen_settings, dict):
+        return None, None, data.get("model_alias", "")
+    n_ctx = gen_settings.get("n_ctx")
+    model_alias = data.get("model_alias", "")
+
+    # n_predict may be in params or at the top level of gen_settings
+    params = gen_settings.get("params", {})
+    n_predict = params.get("n_predict") if isinstance(params, dict) else None
+    if n_predict is None:
+        n_predict = gen_settings.get("n_predict")
+
+    ctx = n_ctx if isinstance(n_ctx, int) and n_ctx > 0 else None
+    # n_predict of -1 means unlimited (up to context size)
+    pred = n_predict if isinstance(n_predict, int) and n_predict > 0 else None
+    return ctx, pred, model_alias
+
+
+def fetch_props_limits(
     endpoint: str, api_key: str | None = None
-) -> tuple[int | None, str]:
+) -> tuple[int | None, int | None, str]:
     """Try GET /props on direct llama.cpp servers.
 
-    Returns (n_ctx, model_alias) or (None, "") on failure.
-    n_ctx is the per-slot runtime context size (max usable per request).
+    Returns (n_ctx, n_predict, model_alias) or (None, None, "") on failure.
     """
     url = f"{_base_url(endpoint)}/props"
     try:
@@ -239,31 +283,28 @@ def fetch_props_context(
         resp.raise_for_status()
         data = resp.json()
     except Exception:
-        return None, ""
+        return None, None, ""
 
-    n_ctx = data.get("default_generation_settings", {}).get("n_ctx")
-    model_alias = data.get("model_alias", "")
-    if isinstance(n_ctx, int) and n_ctx > 0:
-        return n_ctx, model_alias
-    return None, ""
+    return _parse_props_response(data)
 
 
-def fetch_upstream_props_context(
+def fetch_upstream_props_limits(
     endpoint: str,
     model_ids: list[str],
     api_key: str | None = None,
-) -> dict[str, int]:
-    """Fetch runtime context via llama-swap's /upstream/{model}/props passthrough.
+) -> tuple[dict[str, int], dict[str, int]]:
+    """Fetch runtime limits via llama-swap's /upstream/{model}/props passthrough.
 
     Each call loads the model on the remote server, so this should only be
     called after the user has confirmed their selection.
 
-    Returns dict mapping model ID -> runtime n_ctx (per-slot).
+    Returns (contexts, outputs) dicts mapping model ID to token counts.
     """
     base = _base_url(endpoint)
     headers = _auth_headers(api_key)
 
-    result: dict[str, int] = {}
+    contexts: dict[str, int] = {}
+    outputs: dict[str, int] = {}
     for i, mid in enumerate(model_ids, 1):
         print(f"  [{i}/{len(model_ids)}] {mid} ...", end="", flush=True)
         url = f"{base}/upstream/{mid}/props"
@@ -275,14 +316,18 @@ def fetch_upstream_props_context(
             print(" failed")
             continue
 
-        n_ctx = data.get("default_generation_settings", {}).get("n_ctx")
-        if isinstance(n_ctx, int) and n_ctx > 0:
-            result[mid] = n_ctx
-            print(f" {n_ctx:,} tokens")
+        n_ctx, n_predict, _ = _parse_props_response(data)
+        if n_ctx:
+            contexts[mid] = n_ctx
+            parts = [f"context: {n_ctx:,}"]
+            if n_predict:
+                outputs[mid] = n_predict
+                parts.append(f"output: {n_predict:,}")
+            print(f" {', '.join(parts)}")
         else:
-            print(" no context info")
+            print(" no info")
 
-    return result
+    return contexts, outputs
 
 
 # ---------------------------------------------------------------------------
@@ -293,6 +338,10 @@ def fetch_upstream_props_context(
 def parse_context_from_id(model_id: str) -> int | None:
     """Extract context length from model ID segments like '128k', '64k', '192k'.
 
+    Uses k=1000 (not 1024) since model names typically reflect configured
+    context sizes which use decimal thousands. This is an estimate - API-detected
+    context should always be preferred.
+
     Returns token count or None if not found.
     """
     segments = model_id.split("-")
@@ -301,20 +350,22 @@ def parse_context_from_id(model_id: str) -> int | None:
         return None
     # Use the last match (most likely to be the context length)
     ctx_k = int(matches[-1].lower().rstrip("k"))
-    return ctx_k * 1024
+    return ctx_k * 1000
 
 
 def build_model_config(
     model_id: str,
     default_output: int = DEFAULT_OUTPUT_TOKENS,
     api_context: int | None = None,
+    api_output: int | None = None,
 ) -> dict:
     """Build an OpenCode model config entry from a model ID.
 
     Context priority: api_context > name parsing > DEFAULT_CONTEXT_FALLBACK.
+    Output priority: api_output > default_output, capped to context.
     """
     context = api_context or parse_context_from_id(model_id) or DEFAULT_CONTEXT_FALLBACK
-    output = min(default_output, context)
+    output = min(api_output or default_output, context)
     return {
         "name": model_id,
         "limit": {
@@ -1011,31 +1062,42 @@ def main() -> None:
     is_llama_swap = "llama-swap" in owned_by_values
     is_direct_llamacpp = "llamacpp" in owned_by_values and not is_llama_swap
 
-    # --- Context size detection (lightweight probes, no model loading) ---
+    # --- Limit detection (lightweight probes, no model loading) ---
     api_contexts: dict[str, int] = {}
+    api_outputs: dict[str, int] = {}
 
     # 1. Extract from /v1/models response data (free, already fetched)
     for m in raw_models:
         mid = m.get("id", "")
+        if not mid:
+            continue
         ctx = extract_context_from_model_data(m)
-        if mid and ctx:
+        if ctx:
             api_contexts[mid] = ctx
+        out = extract_output_from_model_data(m)
+        if out:
+            api_outputs[mid] = out
 
-    # 2. Try /props (direct llama.cpp - returns runtime context for loaded model)
-    props_ctx, props_alias = fetch_props_context(endpoint, api_key)
+    # 2. Try /props (direct llama.cpp - returns runtime limits for loaded model)
+    props_ctx, props_output, props_alias = fetch_props_limits(endpoint, api_key)
     if props_ctx:
         matched = False
         for mid in all_ids:
             if mid == props_alias or mid.lower() == props_alias.lower():
                 api_contexts[mid] = props_ctx
+                if props_output:
+                    api_outputs[mid] = props_output
                 matched = True
                 break
         if not matched and len(all_ids) == 1:
             api_contexts[all_ids[0]] = props_ctx
+            if props_output:
+                api_outputs[all_ids[0]] = props_output
 
     # 3. Try /model/info (litellm proxy)
-    info_contexts = fetch_model_info_context(endpoint, api_key)
+    info_contexts, info_outputs = fetch_model_info_limits(endpoint, api_key)
     api_contexts.update(info_contexts)
+    api_outputs.update(info_outputs)
 
     if api_contexts:
         print(f"Detected context size for {len(api_contexts)} model(s) from API.")
@@ -1146,25 +1208,62 @@ def main() -> None:
 
         if fetch_upstream:
             if is_llama_swap:
-                upstream_ctx = fetch_upstream_props_context(
+                up_ctx, up_out = fetch_upstream_props_limits(
                     endpoint, models_without_api_ctx, api_key
                 )
             else:
                 # Direct llama.cpp: /props applies to the single loaded model
-                upstream_ctx = {}
+                up_ctx: dict[str, int] = {}
+                up_out: dict[str, int] = {}
                 for mid in models_without_api_ctx:
-                    ctx, _ = fetch_props_context(endpoint, api_key)
+                    ctx, out, _ = fetch_props_limits(endpoint, api_key)
                     if ctx:
-                        upstream_ctx[mid] = ctx
-            api_contexts.update(upstream_ctx)
+                        up_ctx[mid] = ctx
+                    if out:
+                        up_out[mid] = out
+            api_contexts.update(up_ctx)
+            api_outputs.update(up_out)
         else:
             print("Skipping - will use estimates from model names where available.")
+
+    # Warn about models with completely unknown context size and prompt the user
+    unknown_ctx = [
+        mid for mid in selected
+        if mid not in api_contexts and parse_context_from_id(mid) is None
+    ]
+    if unknown_ctx:
+        print(
+            f"\n{len(unknown_ctx)} model(s) have no known context size "
+            f"(not detected from API or model name):"
+        )
+        for mid in unknown_ctx:
+            print(f"  - {mid}")
+        if args.yes:
+            print(f"Using default: {DEFAULT_CONTEXT_FALLBACK:,} tokens")
+            for mid in unknown_ctx:
+                api_contexts[mid] = DEFAULT_CONTEXT_FALLBACK
+        else:
+            answer = input(
+                f"Enter context size in tokens for these models [{DEFAULT_CONTEXT_FALLBACK:,}]: "
+            ).strip()
+            if answer:
+                try:
+                    ctx_val = int(answer.lower().replace("k", "000").replace(",", ""))
+                    if ctx_val <= 0:
+                        raise ValueError
+                except ValueError:
+                    print(f"Invalid value, using default: {DEFAULT_CONTEXT_FALLBACK:,}")
+                    ctx_val = DEFAULT_CONTEXT_FALLBACK
+            else:
+                ctx_val = DEFAULT_CONTEXT_FALLBACK
+            for mid in unknown_ctx:
+                api_contexts[mid] = ctx_val
 
     # Build model configs
     models_config = {}
     for mid in selected:
         models_config[mid] = build_model_config(
-            mid, args.default_output, api_contexts.get(mid)
+            mid, args.default_output, api_contexts.get(mid), api_outputs.get(mid)
         )
 
     if config_path is None:

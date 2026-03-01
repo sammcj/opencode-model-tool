@@ -59,7 +59,7 @@ uv run opencode-model-tool.py --list --endpoint https://llamaswap.your.domain/v1
    - `/props` for direct llama.cpp servers (returns the actual runtime `n_ctx`)
    - `/model/info` for litellm proxies (`model_info.max_input_tokens`)
 3. After you confirm your selection, for llama-swap endpoints it queries `/upstream/{model}/props` to get the actual configured runtime context size per model (this loads each model so it only happens post-confirmation)
-4. Falls back to parsing context from model names (e.g. `128k` in `qwen3-5-27b-128k`), then to a default of 8,192 tokens. API-detected context is shown as `(Xk ctx)`, name-estimated as `(~Xk ctx)`
+4. Falls back to parsing context from model names (e.g. `128k` in `qwen3-5-27b-128k`). If no context can be determined, prompts you to enter one (defaults to 192k). API-detected context is shown as `(Xk ctx)`, name-estimated as `(~Xk ctx)`
 5. Filters out embedding/reranker models by default
 6. Presents a split-pane TUI: model checkboxes on the left, live config diff on the right
 7. Models already in your config are pre-selected; new endpoint models marked `[NEW]`; removed models flagged
