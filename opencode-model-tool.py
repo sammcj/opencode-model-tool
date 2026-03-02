@@ -344,7 +344,9 @@ def parse_context_from_id(model_id: str) -> int | None:
 
     Returns token count or None if not found.
     """
-    segments = model_id.split("-")
+    # Strip Ollama tag suffix (e.g. ":coding-thinking") before parsing
+    base_id = model_id.split(":")[0]
+    segments = base_id.split("-")
     matches = [s for s in segments if re.match(r"^\d+k$", s, re.IGNORECASE)]
     if not matches:
         return None
@@ -1187,7 +1189,10 @@ def main() -> None:
     # After selection: for llama-swap / direct llama.cpp endpoints, offer to
     # query upstream props to get the actual runtime context size.
     newly_added = [mid for mid in selected if mid not in config_model_ids]
-    models_without_api_ctx = [mid for mid in newly_added if mid not in api_contexts]
+    models_without_api_ctx = [
+        mid for mid in newly_added
+        if mid not in api_contexts and parse_context_from_id(mid) is None
+    ]
     if (is_llama_swap or is_direct_llamacpp) and models_without_api_ctx:
         print(
             f"\n{len(models_without_api_ctx)} model(s) don't have a known context size from the API."
