@@ -113,7 +113,7 @@ def normalise_endpoint(url: str) -> str:
     return url
 
 
-def fetch_models(endpoint: str, api_key: str | None = None) -> list[dict]:
+def fetch_models(endpoint: str, api_key: str | None = None) -> list[dict] | None:
     """Fetch model list from the /models endpoint."""
     url = f"{normalise_endpoint(endpoint)}/models"
     headers: dict[str, str] = {}
@@ -124,7 +124,12 @@ def fetch_models(endpoint: str, api_key: str | None = None) -> list[dict]:
         resp = httpx.get(url, headers=headers, timeout=30, follow_redirects=True)
         resp.raise_for_status()
     except httpx.HTTPStatusError as exc:
-        print(f"Error: API returned {exc.response.status_code} from {url}", file=sys.stderr)
+        if exc.response.status_code == 401:
+            return None
+        print(
+            f"Error: API returned {exc.response.status_code} from {url}",
+            file=sys.stderr,
+        )
         sys.exit(1)
     except httpx.ConnectError:
         print(f"Error: Could not connect to {url}", file=sys.stderr)
@@ -466,9 +471,7 @@ def find_models_span(text: str, provider_id: str) -> tuple[int, int] | None:
     search_text = text[section_start : section_end + 1]
 
     # Find the provider key within the provider section
-    provider_pattern = re.compile(
-        rf'"{re.escape(provider_id)}"\s*:\s*\{{', re.DOTALL
-    )
+    provider_pattern = re.compile(rf'"{re.escape(provider_id)}"\s*:\s*\{{', re.DOTALL)
     provider_match = provider_pattern.search(search_text)
     if not provider_match:
         return None
@@ -575,14 +578,14 @@ def format_models_json(models: dict, indent: int = 8) -> str:
     for model_id, config in model_items:
         mid_s = json.dumps(model_id)
         name_s = json.dumps(config["name"])
-        lines.append(f'{" " * indent}{mid_s}: {{')
+        lines.append(f"{' ' * indent}{mid_s}: {{")
         lines.append(f'{" " * (indent + 2)}"name": {name_s},')
         lines.append(f'{" " * (indent + 2)}"limit": {{')
         lines.append(f'{" " * (indent + 4)}"context": {config["limit"]["context"]},')
         lines.append(f'{" " * (indent + 4)}"output": {config["limit"]["output"]}')
-        lines.append(f'{" " * (indent + 2)}}}')
-        lines.append(f'{" " * indent}}},')
-    lines.append(f'{" " * (indent - 2)}}}')
+        lines.append(f"{' ' * (indent + 2)}}}")
+        lines.append(f"{' ' * indent}}},")
+    lines.append(f"{' ' * (indent - 2)}}}")
     return "\n".join(lines)
 
 
@@ -598,7 +601,7 @@ def build_new_provider_block(
     pid_s = json.dumps(provider_id)
     name_s = json.dumps(display_name)
     url_s = json.dumps(endpoint)
-    lines = [f'{indent}{pid_s}: {{']
+    lines = [f"{indent}{pid_s}: {{"]
     lines.append(f'{indent}  "npm": "@ai-sdk/openai-compatible",')
     lines.append(f'{indent}  "name": {name_s},')
     lines.append(f'{indent}  "options": {{')
@@ -607,10 +610,10 @@ def build_new_provider_block(
         lines[-1] = lines[-1] + ","
         key_ref = json.dumps(f"{{env:{api_key_env}}}")
         lines.append(f'{indent}    "apiKey": {key_ref}')
-    lines.append(f'{indent}  }},')
+    lines.append(f"{indent}  }},")
     models_json = format_models_json(models, indent=8)
     lines.append(f'{indent}  "models": {models_json}')
-    lines.append(f'{indent}}}')
+    lines.append(f"{indent}}}")
     return "\n".join(lines)
 
 
@@ -653,13 +656,17 @@ def update_config_models(
         # Check if there's content before the closing brace (need a comma)
         before_close = text[prov_brace_start + 1 : prov_brace_end].rstrip()
         if before_close and not before_close.endswith(","):
-            last_content_pos = prov_brace_start + 1 + len(
-                text[prov_brace_start + 1 : prov_brace_end].rstrip()
+            last_content_pos = (
+                prov_brace_start
+                + 1
+                + len(text[prov_brace_start + 1 : prov_brace_end].rstrip())
             )
             text = text[:last_content_pos] + "," + text[last_content_pos:]
             prov_brace_end += 1
 
-        new_text = text[:prov_brace_end] + "\n" + new_block + ",\n  " + text[prov_brace_end:]
+        new_text = (
+            text[:prov_brace_end] + "\n" + new_block + ",\n  " + text[prov_brace_end:]
+        )
 
     # Show diff relative to what's currently in config
     existing = existing_model_ids or set()
@@ -814,9 +821,9 @@ class ModelSelectorApp(App[list[str] | None]):
         ml = self.query_one("#model-list", ModelList)
         visible_selected = set(ml.selected)
         visible_ids = {
-            sel.value for sel in self._selections
-            if not self._current_filter
-            or self._current_filter in sel.value.lower()
+            sel.value
+            for sel in self._selections
+            if not self._current_filter or self._current_filter in sel.value.lower()
         }
         for vid in visible_ids:
             if vid in visible_selected:
@@ -873,7 +880,9 @@ class ModelSelectorApp(App[list[str] | None]):
 
         # Show models being deselected (were in config, now unchecked)
         if dropping:
-            lines.append("\n[bold yellow]Dropping from config (deselected):[/bold yellow]")
+            lines.append(
+                "\n[bold yellow]Dropping from config (deselected):[/bold yellow]"
+            )
             for mid in dropping:
                 lines.append(f"  [yellow]- {mid}[/yellow]")
 
@@ -887,9 +896,7 @@ class ModelSelectorApp(App[list[str] | None]):
                 lines.append(f"  [red]x {mid}[/red]")
 
         if self._removed_other:
-            lines.append(
-                "\n[dim]Also gone from endpoint (were not in config):[/dim]"
-            )
+            lines.append("\n[dim]Also gone from endpoint (were not in config):[/dim]")
             for mid in self._removed_other:
                 lines.append(f"  [dim]- {mid}[/dim]")
 
@@ -964,9 +971,7 @@ def categorise_models(
     return new, in_config, available, gone_configured, gone_other
 
 
-def _make_label(
-    mid: str, prefix: str = "", api_context: int | None = None
-) -> Text:
+def _make_label(mid: str, prefix: str = "", api_context: int | None = None) -> Text:
     """Build a styled label for a model selection entry."""
     if api_context:
         ctx_str = f" ({api_context // 1024}k ctx)"
@@ -994,8 +999,8 @@ def interactive_select(
     Returns selected model IDs, or None if cancelled.
     """
     contexts = api_contexts or {}
-    new, in_config, available, gone_configured, gone_other = (
-        categorise_models(model_ids, state_entry, config_model_ids)
+    new, in_config, available, gone_configured, gone_other = categorise_models(
+        model_ids, state_entry, config_model_ids
     )
 
     selections: list[Selection[str]] = []
@@ -1017,7 +1022,11 @@ def interactive_select(
         return []
 
     app = ModelSelectorApp(
-        selections, config_model_ids, gone_configured, gone_other, default_output,
+        selections,
+        config_model_ids,
+        gone_configured,
+        gone_other,
+        default_output,
         api_contexts=contexts,
     )
     return app.run()
@@ -1051,6 +1060,11 @@ def main() -> None:
     # Fetch models from endpoint
     print(f"Fetching models from {endpoint}/models ...")
     raw_models = fetch_models(endpoint, api_key)
+
+    if raw_models is None:
+        print("\nAuthentication required.")
+        api_key = input("Please enter your API key: ").strip()
+        raw_models = fetch_models(endpoint, api_key)
 
     if not raw_models:
         print("No models returned from the endpoint.")
@@ -1129,7 +1143,11 @@ def main() -> None:
                 print(f"  {mid}  context: {api_ctx:,}")
             else:
                 name_ctx = parse_context_from_id(mid)
-                ctx_str = f"  context: ~{name_ctx:,} (from name)" if name_ctx else "  context: unknown"
+                ctx_str = (
+                    f"  context: ~{name_ctx:,} (from name)"
+                    if name_ctx
+                    else "  context: unknown"
+                )
                 print(f"  {mid}{ctx_str}")
         return
 
@@ -1156,7 +1174,9 @@ def main() -> None:
         if provider_id:
             config_model_ids = read_config_model_ids(config_data, provider_id)
             if config_model_ids:
-                print(f"Found {len(config_model_ids)} existing model(s) for provider '{provider_id}'.")
+                print(
+                    f"Found {len(config_model_ids)} existing model(s) for provider '{provider_id}'."
+                )
 
     # Load state
     state = load_state()
@@ -1175,7 +1195,10 @@ def main() -> None:
                 print(f"  x {mid}")
     else:
         selected = interactive_select(
-            model_ids, state_entry, config_model_ids, args.default_output,
+            model_ids,
+            state_entry,
+            config_model_ids,
+            args.default_output,
             api_contexts=api_contexts,
         )
         if selected is None:
@@ -1190,7 +1213,8 @@ def main() -> None:
     # query upstream props to get the actual runtime context size.
     newly_added = [mid for mid in selected if mid not in config_model_ids]
     models_without_api_ctx = [
-        mid for mid in newly_added
+        mid
+        for mid in newly_added
         if mid not in api_contexts and parse_context_from_id(mid) is None
     ]
     if (is_llama_swap or is_direct_llamacpp) and models_without_api_ctx:
@@ -1208,7 +1232,9 @@ def main() -> None:
         if args.yes:
             fetch_upstream = True
         else:
-            answer = input("Fetch context sizes from the server? [Y/n] ").strip().lower()
+            answer = (
+                input("Fetch context sizes from the server? [Y/n] ").strip().lower()
+            )
             fetch_upstream = not answer or answer in ("y", "yes")
 
         if fetch_upstream:
@@ -1233,7 +1259,8 @@ def main() -> None:
 
     # Warn about models with completely unknown context size and prompt the user
     unknown_ctx = [
-        mid for mid in selected
+        mid
+        for mid in selected
         if mid not in api_contexts and parse_context_from_id(mid) is None
     ]
     if unknown_ctx:
