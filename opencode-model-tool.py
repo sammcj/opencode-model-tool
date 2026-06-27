@@ -417,6 +417,8 @@ def find_config() -> Path | None:
     candidates = [
         Path.home() / ".opencode" / "opencode.jsonc",
         Path.home() / ".opencode" / "opencode.json",
+        Path.home() / ".config" / "opencode" / "opencode.jsonc",
+        Path.home() / ".config" / "opencode" / "opencode.json",
     ]
     for c in candidates:
         if c.exists():
