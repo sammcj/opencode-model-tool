@@ -182,7 +182,7 @@ def extract_context_from_model_data(model: dict) -> int | None:
         if isinstance(n_ctx, int) and n_ctx > 0:
             return n_ctx
 
-    for key in ("context_length", "max_model_len", "context_window"):
+    for key in ("context_length", "max_model_len", "context_window", "max_context_window"):
         val = model.get(key)
         if isinstance(val, int) and val > 0:
             return val
