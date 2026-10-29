@@ -12,6 +12,7 @@ Usage:
     uv run opencode-model-tool.py --endpoint https://llamaswap.your.domain/v1
     uv run opencode-model-tool.py --endpoint http://localhost:8080/v1 --api-key sk-...
     uv run opencode-model-tool.py --list --endpoint https://llamaswap.your.domain/v1
+    uv run opencode-model-tool.py --endpoint http://localhost:8080/v1 --add
 """
 
 from __future__ import annotations
@@ -58,6 +59,17 @@ def parse_args() -> argparse.Namespace:
         "--provider-id",
         help="Provider key in opencode config. Auto-detected from baseURL if omitted.",
     )
+    p.add_argument(
+        "--provider-name",
+        help="Human-readable provider name. Derived from provider ID if omitted.",
+    )
+    p.add_argument(
+        "--add",
+        action="store_true",
+        help="Add a new provider entry to the config (fails if it already "
+        "exists), then continue to model selection.",
+    )
+
     p.add_argument(
         "--config",
         help="Path to opencode config file. Auto-detected if omitted.",
@@ -437,6 +449,31 @@ def detect_provider_id(config_data: dict, endpoint: str) -> str | None:
     return None
 
 
+def derive_provider_id(endpoint: str) -> str:
+    """Derive a provider key from the endpoint hostname.
+
+    For IP hosts the full address is used so distinct IPs (e.g.
+    172.31.0.100, 172.31.0.101) become distinct provider keys.
+    """
+    parsed_url = urlparse(endpoint)
+    hostname = parsed_url.hostname or "local"
+    if ":" in hostname:
+        return "local_llm"  # IPv6
+    parts = hostname.split(".")
+    # IP address -> keep the whole address as the provider key
+    if all(part.isdigit() for part in parts):
+        return hostname.replace("-", "_")
+    default_id = hostname.split(".")[0].replace("-", "_")
+    if default_id in ("localhost", "127", "192", "10"):
+        default_id = "local_llm"
+    return default_id
+
+
+def derive_provider_name(provider_id: str) -> str:
+    """Derive a human-readable provider name from the provider ID."""
+    return provider_id.replace("_", " ").title()
+
+
 def read_config_model_ids(config_data: dict, provider_id: str) -> set[str]:
     """Read model IDs currently configured for a provider."""
     provider = config_data.get("provider", {}).get(provider_id, {})
@@ -592,15 +629,20 @@ def format_models_json(models: dict, indent: int = 8) -> str:
     return "\n".join(lines)
 
 
-def build_new_provider_block(
+def build_provider_entry(
     provider_id: str,
     display_name: str,
     endpoint: str,
     models: dict,
     api_key_env: str | None = None,
+    base_indent: int = 4,
 ) -> str:
-    """Build a complete new provider block for insertion into the config."""
-    indent = "    "
+    """Build a single provider entry block for insertion into the config.
+
+    `base_indent` controls the indentation of the provider's keys (4 for a
+    provider nested under "provider", matching existing config style).
+    """
+    indent = " " * base_indent
     pid_s = json.dumps(provider_id)
     name_s = json.dumps(display_name)
     url_s = json.dumps(endpoint)
@@ -614,10 +656,84 @@ def build_new_provider_block(
         key_ref = json.dumps(f"{{env:{api_key_env}}}")
         lines.append(f'{indent}    "apiKey": {key_ref}')
     lines.append(f"{indent}  }},")
-    models_json = format_models_json(models, indent=8)
+    models_json = format_models_json(models, indent=base_indent + 4)
     lines.append(f'{indent}  "models": {models_json}')
     lines.append(f"{indent}}}")
     return "\n".join(lines)
+
+
+def build_new_provider_block(
+    provider_id: str,
+    display_name: str,
+    endpoint: str,
+    models: dict,
+    api_key_env: str | None = None,
+) -> str:
+    """Build a complete new provider block for insertion into the config."""
+    return build_provider_entry(
+        provider_id, display_name, endpoint, models, api_key_env, base_indent=4
+    )
+
+
+def find_root_brace(text: str) -> tuple[int, int] | None:
+    """Return (start, end) of the root JSON object's braces, or None.
+
+    Skips JSONC comments and strings to find the first real top-level '{'.
+    """
+    in_string = False
+    in_line_comment = False
+    in_block_comment = False
+    i = 0
+    while i < len(text):
+        ch = text[i]
+
+        if in_line_comment:
+            if ch == "\n":
+                in_line_comment = False
+            i += 1
+            continue
+
+        if in_block_comment:
+            if ch == "*" and i + 1 < len(text) and text[i + 1] == "/":
+                in_block_comment = False
+                i += 2
+                continue
+            i += 1
+            continue
+
+        if in_string:
+            if ch == "\\" and i + 1 < len(text):
+                i += 2  # skip escaped char
+                continue
+            if ch == '"':
+                in_string = False
+            i += 1
+            continue
+
+        if ch == "/" and i + 1 < len(text):
+            next_ch = text[i + 1]
+            if next_ch == "/":
+                in_line_comment = True
+                i += 2
+                continue
+            if next_ch == "*":
+                in_block_comment = True
+                i += 2
+                continue
+
+        if ch == '"':
+            in_string = True
+            i += 1
+            continue
+
+        if ch == "{":
+            end = find_matching_brace(text, i)
+            if end is None:
+                return None
+            return i, end
+
+        i += 1
+    return None
 
 
 def update_config_models(
@@ -707,6 +823,85 @@ def update_config_models(
             return False
 
     # Backup
+    backup_path = config_path.with_suffix(config_path.suffix + ".bak")
+    shutil.copy2(config_path, backup_path)
+    print(f"Backup saved to {backup_path}")
+
+    config_path.write_text(new_text)
+    print(f"Config updated: {config_path}")
+    return True
+
+
+def bootstrap_provider(
+    config_path: Path,
+    provider_id: str,
+    display_name: str,
+    endpoint: str,
+    api_key_env: str | None = None,
+    skip_confirm: bool = False,
+) -> bool:
+    """Ensure a top-level 'provider' section and the given empty provider entry exist.
+
+    Adds the provider entry (with an empty 'models' object) if it is not yet
+    present, creating the top-level 'provider' section if needed. Returns True
+    if the config was modified, False if the provider already exists.
+    """
+    text = config_path.read_text()
+    prov_span = find_provider_section_span(text)
+
+    if prov_span is not None:
+        prov_brace_start, prov_brace_end = prov_span
+        # Check whether the provider already exists inside the section
+        search_text = text[prov_brace_start : prov_brace_end + 1]
+        provider_pattern = re.compile(
+            rf'"{re.escape(provider_id)}"\s*:\s*\{{', re.DOTALL
+        )
+        if provider_pattern.search(search_text):
+            return False
+
+        entry = build_provider_entry(
+            provider_id, display_name, endpoint, {}, api_key_env, base_indent=4
+        )
+        before_close = text[prov_brace_start + 1 : prov_brace_end].rstrip()
+        if before_close and not before_close.endswith(","):
+            last_content_pos = prov_brace_start + 1 + len(before_close)
+            text = text[:last_content_pos] + "," + text[last_content_pos:]
+            prov_brace_end += 1
+        new_text = (
+            text[:prov_brace_end] + "\n" + entry + ",\n  " + text[prov_brace_end:]
+        )
+    else:
+        # No top-level 'provider' dict - add one with the entry inside
+        root_span = find_root_brace(text)
+        if root_span is None:
+            print("Error: Could not find root JSON object in config.", file=sys.stderr)
+            return False
+        root_start, root_end = root_span
+
+        entry = build_provider_entry(
+            provider_id, display_name, endpoint, {}, api_key_env, base_indent=4
+        )
+        before_close = text[root_start + 1 : root_end].rstrip()
+        if before_close and not before_close.endswith(","):
+            last_content_pos = root_start + 1 + len(before_close)
+            text = text[:last_content_pos] + "," + text[last_content_pos:]
+            root_end += 1
+        provider_block = '"provider": {\n' + entry + "\n  }"
+        new_text = (
+            text[:root_end] + "\n  " + provider_block + ",\n" + text[root_end:]
+        )
+
+    print(f"\nAdding new provider '{provider_id}' to {config_path}")
+    print(f"  name: {display_name}")
+    print(f"  baseURL: {endpoint}")
+    print()
+
+    if not skip_confirm:
+        answer = input("Add this provider? [Y/n] ").strip().lower()
+        if answer and answer not in ("y", "yes"):
+            print("Cancelled.")
+            return False
+
     backup_path = config_path.with_suffix(config_path.suffix + ".bak")
     shutil.copy2(config_path, backup_path)
     print(f"Backup saved to {backup_path}")
@@ -1181,6 +1376,30 @@ def main() -> None:
                     f"Found {len(config_model_ids)} existing model(s) for provider '{provider_id}'."
                 )
 
+    # --add: create a new provider entry (fail if it already exists)
+    if args.add:
+        if config_path is None:
+            print("Error: --add requires a config file.", file=sys.stderr)
+            sys.exit(1)
+        if provider_id is not None:
+            print(
+                f"Error: Provider '{provider_id}' already exists in the config.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        provider_id = args.provider_id or derive_provider_id(endpoint)
+        display_name = args.provider_name or derive_provider_name(provider_id)
+        if not bootstrap_provider(
+            config_path,
+            provider_id,
+            display_name,
+            endpoint,
+            api_key_env=args.api_key_env,
+            skip_confirm=args.yes,
+        ):
+            print("Cancelled.")
+            return
+
     # Load state
     state = load_state()
     state_entry = state.get(endpoint, {})
@@ -1316,11 +1535,7 @@ def main() -> None:
 
     # Prompt for provider_id if not yet resolved (new provider)
     if provider_id is None:
-        parsed_url = urlparse(endpoint)
-        hostname = parsed_url.hostname or "local"
-        default_id = hostname.split(".")[0].replace("-", "_")
-        if default_id in ("localhost", "127", "192", "10"):
-            default_id = "local_llm"
+        default_id = derive_provider_id(endpoint)
 
         if args.yes:
             provider_id = default_id
