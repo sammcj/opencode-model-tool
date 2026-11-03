@@ -82,6 +82,11 @@ def parse_args() -> argparse.Namespace:
         help="Include embedding/reranker models (excluded by default).",
     )
     p.add_argument(
+        "--only-free",
+        action="store_true",
+        help="Only show/select free models (zero-priced or tagged 'free').",
+    )
+    p.add_argument(
         "--list",
         action="store_true",
         dest="list_only",
@@ -154,6 +159,40 @@ def is_excluded(model_id: str) -> bool:
     return any(pat in lower for pat in EXCLUDED_PATTERNS)
 
 
+def is_free_model(model: dict) -> bool:
+    """Return True if a model is free (zero-priced or tagged 'free').
+
+    A model counts as free if both input and output prices are 0, or if
+    its tags include a 'free' tag (provider-specific schemas vary).
+    """
+    config = model.get("config")
+    if not isinstance(config, dict):
+        return False
+
+    pricing = config.get("pricing")
+    if isinstance(pricing, dict):
+        zero = True
+        for key in ("input", "output"):
+            val = pricing.get(key)
+            try:
+                if float(val) != 0:  # type: ignore[arg-type]
+                    zero = False
+                    break
+            except (TypeError, ValueError):
+                zero = False
+                break
+        if zero:
+            return True
+
+    tags = config.get("tags")
+    if isinstance(tags, list) and any(
+        str(tag).strip().lower() == "free" for tag in tags
+    ):
+        return True
+
+    return False
+
+
 def _base_url(endpoint: str) -> str:
     """Strip /v1 suffix to get the server base URL."""
     norm = normalise_endpoint(endpoint)
@@ -169,12 +208,21 @@ def _auth_headers(api_key: str | None) -> dict[str, str]:
     return {}
 
 
+def _first_positive_int(values) -> int | None:
+    """Return the first positive int in an iterable, or None."""
+    for val in values:
+        if isinstance(val, int) and val > 0:
+            return val
+    return None
+
+
 def extract_context_from_model_data(model: dict) -> int | None:
     """Extract context size from model API response data.
 
     Checks fields used by different providers:
     - meta.n_ctx_train (llama.cpp / llamaswap)
     - context_length, max_model_len, context_window (other providers)
+    - config.context_window / config.capabilities.max_context_window (AskCodi & co.)
     """
     meta = model.get("meta")
     if isinstance(meta, dict):
@@ -182,10 +230,26 @@ def extract_context_from_model_data(model: dict) -> int | None:
         if isinstance(n_ctx, int) and n_ctx > 0:
             return n_ctx
 
-    for key in ("context_length", "max_model_len", "context_window", "max_context_window"):
-        val = model.get(key)
-        if isinstance(val, int) and val > 0:
-            return val
+    ctx = _first_positive_int(
+        model.get(key)
+        for key in ("context_length", "max_model_len", "context_window", "max_context_window")
+    )
+    if ctx is not None:
+        return ctx
+
+    # Nested config block (AskCodi, some gateways)
+    config = model.get("config")
+    if isinstance(config, dict):
+        ctx = _first_positive_int(
+            [config.get("context_window"), config.get("max_context_window")]
+        )
+        if ctx is not None:
+            return ctx
+        caps = config.get("capabilities")
+        if isinstance(caps, dict):
+            ctx = _first_positive_int([caps.get("max_context_window")])
+            if ctx is not None:
+                return ctx
 
     return None
 
@@ -195,11 +259,19 @@ def extract_output_from_model_data(model: dict) -> int | None:
 
     Checks fields used by different providers:
     - max_output_tokens, max_completion_tokens (OpenAI-style)
+    - config.max_tokens (AskCodi & co.)
     """
-    for key in ("max_output_tokens", "max_completion_tokens"):
-        val = model.get(key)
-        if isinstance(val, int) and val > 0:
-            return val
+    out = _first_positive_int(
+        model.get(key) for key in ("max_output_tokens", "max_completion_tokens")
+    )
+    if out is not None:
+        return out
+
+    config = model.get("config")
+    if isinstance(config, dict):
+        out = _first_positive_int([config.get("max_tokens")])
+        if out is not None:
+            return out
 
     return None
 
@@ -1132,6 +1204,12 @@ def main() -> None:
                 f"Excluded {excluded_count} embedding/reranker models "
                 f"(use --include-embeddings to show them)."
             )
+
+    # Optionally restrict to free models
+    if args.only_free:
+        free_ids = {m["id"] for m in raw_models if is_free_model(m)}
+        model_ids = [mid for mid in model_ids if mid in free_ids]
+        print(f"Filtered to {len(model_ids)} free model(s).")
 
     if not model_ids:
         print("No eligible models after filtering.")
