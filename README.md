@@ -50,7 +50,7 @@ uv run opencode-model-tool.py --list --endpoint https://api.askcodi.com/v1 --onl
 | `--api-key-env VAR`    | Environment variable name containing the API key                                    |
 | `--default-output N`   | Default max output tokens (default: 65536)                                          |
 | `--include-embeddings` | Include embedding/reranker models (excluded by default)                             |
-| `--only-free`          | Only show/select free models (zero-priced or tagged "free")                           |
+| `--only-free`          | Only show/select free models (zero-priced or tagged "free"), keeps configured models  |
 | `--list`               | List available models without interactive selection                                 |
 | `--all`                | Select all models (skip interactive picker)                                         |
 | `--yes`                | Skip confirmation prompt before writing config                                      |

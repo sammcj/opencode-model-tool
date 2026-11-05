@@ -159,38 +159,48 @@ def is_excluded(model_id: str) -> bool:
     return any(pat in lower for pat in EXCLUDED_PATTERNS)
 
 
+def _is_zero_priced(pricing: object) -> bool:
+    """Return True if a pricing block has zero input and output prices.
+
+    Accepts input/output (AskCodi) and prompt/completion (OpenRouter) keys.
+    """
+    if not isinstance(pricing, dict):
+        return False
+
+    for input_key, output_key in (("input", "output"), ("prompt", "completion")):
+        try:
+            if float(pricing[input_key]) == 0 and float(pricing[output_key]) == 0:
+                return True
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    return False
+
+
 def is_free_model(model: dict) -> bool:
     """Return True if a model is free (zero-priced or tagged 'free').
 
-    A model counts as free if both input and output prices are 0, or if
-    its tags include a 'free' tag (provider-specific schemas vary).
+    Providers put pricing and tags either on the model entry (OpenRouter) or
+    in a nested config block (AskCodi), so both levels are checked.
     """
     config = model.get("config")
-    if not isinstance(config, dict):
-        return False
+    blocks = (model, config) if isinstance(config, dict) else (model,)
 
-    pricing = config.get("pricing")
-    if isinstance(pricing, dict):
-        zero = True
-        for key in ("input", "output"):
-            val = pricing.get(key)
-            try:
-                if float(val) != 0:  # type: ignore[arg-type]
-                    zero = False
-                    break
-            except (TypeError, ValueError):
-                zero = False
-                break
-        if zero:
+    for block in blocks:
+        if _is_zero_priced(block.get("pricing")):
+            return True
+        tags = block.get("tags")
+        if isinstance(tags, list) and any(
+            str(tag).strip().lower() == "free" for tag in tags
+        ):
             return True
 
-    tags = config.get("tags")
-    if isinstance(tags, list) and any(
-        str(tag).strip().lower() == "free" for tag in tags
-    ):
-        return True
-
     return False
+
+
+def free_model_ids(raw_models: list[dict]) -> set[str]:
+    """Return the IDs of free models, ignoring entries without an ID."""
+    return {m["id"] for m in raw_models if "id" in m and is_free_model(m)}
 
 
 def _base_url(endpoint: str) -> str:
@@ -1023,25 +1033,30 @@ def categorise_models(
     model_ids: list[str],
     state_entry: dict,
     config_model_ids: set[str],
+    endpoint_ids: list[str] | None = None,
 ) -> tuple[list[str], list[str], list[str], list[str], list[str]]:
     """Categorise models relative to state and current config.
 
+    model_ids are the models on offer. endpoint_ids are all models on the
+    endpoint, and default to model_ids when no filter narrowed the offer.
+
     Returns (new, in_config, available, gone_configured, gone_other).
-    - new: on endpoint, never seen in state before, not already in config.
-    - in_config: on endpoint AND currently in the config file.
-    - available: on endpoint, not new, not in config.
+    - new: on offer, never seen in state before, not already in config.
+    - in_config: on offer AND currently in the config file.
+    - available: on offer, not new, not in config.
     - gone_configured: in config but no longer on the endpoint.
     - gone_other: was known in state, not on endpoint, not in config.
     """
     known = set(state_entry.get("known", []))
     current = set(model_ids)
+    on_endpoint = current if endpoint_ids is None else set(endpoint_ids)
     config = config_model_ids
 
     new = sorted(current - known - config)
     in_config = sorted(current & config)
     available = sorted(current - set(new) - config)
-    gone_configured = sorted(config - current)
-    gone_other = sorted((known - current) - config)
+    gone_configured = sorted(config - on_endpoint)
+    gone_other = sorted((known - on_endpoint) - config)
 
     return new, in_config, available, gone_configured, gone_other
 
@@ -1065,6 +1080,7 @@ def interactive_select(
     config_model_ids: set[str],
     default_output: int = DEFAULT_OUTPUT_TOKENS,
     api_contexts: dict[str, int] | None = None,
+    endpoint_ids: list[str] | None = None,
 ) -> list[str] | None:
     """Show an interactive split-pane TUI for model selection.
 
@@ -1075,7 +1091,7 @@ def interactive_select(
     """
     contexts = api_contexts or {}
     new, in_config, available, gone_configured, gone_other = categorise_models(
-        model_ids, state_entry, config_model_ids
+        model_ids, state_entry, config_model_ids, endpoint_ids
     )
 
     selections: list[Selection[str]] = []
@@ -1206,9 +1222,11 @@ def main() -> None:
             )
 
     # Optionally restrict to free models
+    endpoint_ids = model_ids
+    free_ids: set[str] = set()
     if args.only_free:
-        free_ids = {m["id"] for m in raw_models if is_free_model(m)}
-        model_ids = [mid for mid in model_ids if mid in free_ids]
+        free_ids = free_model_ids(raw_models)
+        model_ids = [mid for mid in endpoint_ids if mid in free_ids]
         print(f"Filtered to {len(model_ids)} free model(s).")
 
     if not model_ids:
@@ -1259,6 +1277,13 @@ def main() -> None:
                     f"Found {len(config_model_ids)} existing model(s) for provider '{provider_id}'."
                 )
 
+    # The models block is replaced wholesale on write, so a configured paid
+    # model left out of the offer would be deleted from the config.
+    if args.only_free:
+        model_ids = [
+            mid for mid in endpoint_ids if mid in free_ids or mid in config_model_ids
+        ]
+
     # Load state
     state = load_state()
     state_entry = state.get(endpoint, {})
@@ -1267,7 +1292,7 @@ def main() -> None:
     if args.all:
         selected = model_ids
         _, _, _, gone_configured, _ = categorise_models(
-            model_ids, state_entry, config_model_ids
+            model_ids, state_entry, config_model_ids, endpoint_ids
         )
         print(f"\nSelected all {len(selected)} models.")
         if gone_configured:
@@ -1281,6 +1306,7 @@ def main() -> None:
             config_model_ids,
             args.default_output,
             api_contexts=api_contexts,
+            endpoint_ids=endpoint_ids,
         )
         if selected is None:
             print("Cancelled.")
@@ -1385,7 +1411,7 @@ def main() -> None:
         print(json.dumps(models_config, indent=2))
         state[endpoint] = {
             "selected": sorted(selected),
-            "known": sorted(model_ids),
+            "known": sorted(endpoint_ids),
         }
         save_state(state)
         return
@@ -1424,7 +1450,7 @@ def main() -> None:
     if updated:
         state[endpoint] = {
             "selected": sorted(selected),
-            "known": sorted(model_ids),
+            "known": sorted(endpoint_ids),
         }
         save_state(state)
 
