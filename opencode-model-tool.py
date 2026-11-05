@@ -160,7 +160,7 @@ def is_excluded(model_id: str) -> bool:
 
 
 def _is_zero_priced(pricing: object) -> bool:
-    """Return True if a pricing block has zero input and output prices.
+    """Return True if a pricing block has no token or per-request charge.
 
     Accepts input/output (AskCodi) and prompt/completion (OpenRouter) keys.
     """
@@ -169,7 +169,11 @@ def _is_zero_priced(pricing: object) -> bool:
 
     for input_key, output_key in (("input", "output"), ("prompt", "completion")):
         try:
-            if float(pricing[input_key]) == 0 and float(pricing[output_key]) == 0:
+            if (
+                float(pricing[input_key]) == 0
+                and float(pricing[output_key]) == 0
+                and float(pricing.get("request", 0)) == 0
+            ):
                 return True
         except (KeyError, TypeError, ValueError):
             continue
@@ -519,10 +523,10 @@ def detect_provider_id(config_data: dict, endpoint: str) -> str | None:
     return None
 
 
-def read_config_model_ids(config_data: dict, provider_id: str) -> set[str]:
-    """Read model IDs currently configured for a provider."""
+def read_config_models(config_data: dict, provider_id: str) -> dict[str, dict]:
+    """Read the model entries currently configured for a provider."""
     provider = config_data.get("provider", {}).get(provider_id, {})
-    return set(provider.get("models", {}).keys())
+    return provider.get("models", {})
 
 
 def find_provider_section_span(text: str) -> tuple[int, int] | None:
@@ -653,25 +657,16 @@ def find_matching_brace(text: str, start: int) -> int | None:
 
 
 def format_models_json(models: dict, indent: int = 8) -> str:
-    """Format a models dict as JSONC-style JSON with trailing commas."""
+    """Format a models dict as JSON, indented to sit inside a provider block."""
     if not models:
         return "{}"
 
-    lines = ["{"]
-    model_items = list(models.items())
-    for i, (model_id, config) in enumerate(model_items):
-        last = i == len(model_items) - 1
-        mid_s = json.dumps(model_id)
-        name_s = json.dumps(config["name"])
-        lines.append(f"{' ' * indent}{mid_s}: {{")
-        lines.append(f'{" " * (indent + 2)}"name": {name_s},')
-        lines.append(f'{" " * (indent + 2)}"limit": {{')
-        lines.append(f'{" " * (indent + 4)}"context": {config["limit"]["context"]},')
-        lines.append(f'{" " * (indent + 4)}"output": {config["limit"]["output"]}')
-        lines.append(f"{' ' * (indent + 2)}}}")
-        lines.append(f"{' ' * indent}}}," if not last else f"{' ' * indent}}}")
-    lines.append(f"{' ' * (indent - 2)}}}")
-    return "\n".join(lines)
+    pad = " " * indent
+    entries = []
+    for model_id, config in models.items():
+        body = json.dumps(config, indent=2, ensure_ascii=False)
+        entries.append(f"{pad}{json.dumps(model_id)}: " + body.replace("\n", f"\n{pad}"))
+    return "{\n" + ",\n".join(entries) + f"\n{' ' * (indent - 2)}}}"
 
 
 def build_new_provider_block(
@@ -774,8 +769,9 @@ def update_config_models(
     if keeping:
         print(f"\n  Keeping {len(keeping)} model(s):")
         for mid in keeping:
-            ctx = models[mid]["limit"]["context"]
-            print(f"    = {mid} (context: {ctx:,})")
+            # Entries preserved from the config may not set a limit
+            ctx = models[mid].get("limit", {}).get("context")
+            print(f"    = {mid} (context: {f'{ctx:,}' if ctx else 'unknown'})")
     if removing:
         print(f"\n  Removing {len(removing)} model(s):")
         for mid in removing:
@@ -1261,6 +1257,7 @@ def main() -> None:
 
     config_data = None
     provider_id = None
+    config_models: dict[str, dict] = {}
     config_model_ids: set[str] = set()
 
     if config_path is not None:
@@ -1271,18 +1268,24 @@ def main() -> None:
             sys.exit(1)
         provider_id = args.provider_id or detect_provider_id(config_data, endpoint)
         if provider_id:
-            config_model_ids = read_config_model_ids(config_data, provider_id)
+            config_models = read_config_models(config_data, provider_id)
+            config_model_ids = set(config_models)
             if config_model_ids:
                 print(
                     f"Found {len(config_model_ids)} existing model(s) for provider '{provider_id}'."
                 )
 
     # The models block is replaced wholesale on write, so a configured paid
-    # model left out of the offer would be deleted from the config.
+    # model left out of the offer would be deleted from the config. Their
+    # entries are written back as they are because the filter doesn't cover them.
+    preserved: dict[str, dict] = {}
     if args.only_free:
-        model_ids = [
-            mid for mid in endpoint_ids if mid in free_ids or mid in config_model_ids
-        ]
+        preserved = {
+            mid: config_models[mid]
+            for mid in endpoint_ids
+            if mid in config_model_ids and mid not in free_ids
+        }
+        model_ids = [mid for mid in endpoint_ids if mid in free_ids or mid in preserved]
 
     # Load state
     state = load_state()
@@ -1373,7 +1376,9 @@ def main() -> None:
     unknown_ctx = [
         mid
         for mid in selected
-        if mid not in api_contexts and parse_context_from_id(mid) is None
+        if mid not in preserved
+        and mid not in api_contexts
+        and parse_context_from_id(mid) is None
     ]
     if unknown_ctx:
         print(
@@ -1406,7 +1411,7 @@ def main() -> None:
     # Build model configs
     models_config = {}
     for mid in selected:
-        models_config[mid] = build_model_config(
+        models_config[mid] = preserved.get(mid) or build_model_config(
             mid, args.default_output, api_contexts.get(mid), api_outputs.get(mid)
         )
 

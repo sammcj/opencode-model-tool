@@ -29,6 +29,12 @@ RAW_MODELS = [
     {"id": "free/one", "config": {"pricing": FREE_PRICING}},
 ]
 
+CONFIGURED_PAID_ENTRY = {
+    "name": "My paid model",
+    "limit": {"context": 1000, "output": 100},
+    "options": {"reasoningEffort": "high"},
+}
+
 
 @pytest.mark.parametrize(
     "model",
@@ -38,6 +44,7 @@ RAW_MODELS = [
         {"config": {"pricing": {"prompt": "0", "completion": "0"}}},
         {"config": {"tags": ["tool-use", " Free "]}},
         {"pricing": {"prompt": "0", "completion": "0"}},
+        {"pricing": {"prompt": "0", "completion": "0", "request": "0"}},
         {"pricing": {"input": "0", "output": "0"}},
         {"tags": ["free"]},
     ],
@@ -58,6 +65,9 @@ def test_is_free_model_accepts_free_schemas(model):
         {"pricing": {"prompt": "-1", "completion": "-1"}},
         {"pricing": {"prompt": None, "completion": "n/a"}},
         {"pricing": {"input": "0", "completion": "0"}},
+        {"pricing": {"prompt": "0", "completion": "0", "request": "0.01"}},
+        {"pricing": {"prompt": "0", "completion": "0", "request": "n/a"}},
+        {"config": {"pricing": {"input": "0", "output": "0", "request": "0.01"}}},
     ],
 )
 def test_is_free_model_rejects_paid_or_unknown(model):
@@ -123,12 +133,7 @@ def run_tool(monkeypatch, tmp_path):
                 "provider": {
                     "fake": {
                         "options": {"baseURL": ENDPOINT},
-                        "models": {
-                            "paid/configured": {
-                                "name": "paid/configured",
-                                "limit": {"context": 1000, "output": 100},
-                            }
-                        },
+                        "models": {"paid/configured": CONFIGURED_PAID_ENTRY},
                     }
                 }
             },
@@ -154,6 +159,38 @@ def run_tool(monkeypatch, tmp_path):
 def test_only_free_keeps_configured_paid_models(run_tool):
     models = run_tool("--only-free", "--all", "--yes")
     assert set(models) == {"free/one", "paid/configured"}
+    assert models["paid/configured"] == CONFIGURED_PAID_ENTRY
+
+
+def test_format_models_json_layout():
+    entry = {"name": "a", "limit": {"context": 1, "output": 2}}
+    assert tool.format_models_json({"a": entry, "b": {"name": "b"}}) == (
+        "{\n"
+        '        "a": {\n'
+        '          "name": "a",\n'
+        '          "limit": {\n'
+        '            "context": 1,\n'
+        '            "output": 2\n'
+        "          }\n"
+        "        },\n"
+        '        "b": {\n'
+        '          "name": "b"\n'
+        "        }\n"
+        "      }"
+    )
+
+
+def test_update_config_keeps_entry_without_limit(tmp_path, capsys):
+    config_path = tmp_path / "opencode.json"
+    models = {"a": {"name": "a"}}
+    config_path.write_text(json.dumps({"provider": {"fake": {"models": models}}}))
+
+    assert tool.update_config_models(
+        config_path, "fake", models, ENDPOINT, {"a"}, skip_confirm=True
+    )
+
+    assert "= a (context: unknown)" in capsys.readouterr().out
+    assert json.loads(config_path.read_text())["provider"]["fake"]["models"] == models
 
 
 def test_only_free_does_not_add_unconfigured_paid_models(run_tool):
