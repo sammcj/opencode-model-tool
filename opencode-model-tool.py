@@ -1288,6 +1288,11 @@ def main() -> None:
     state = load_state()
     state_entry = state.get(endpoint, {})
 
+    # Models hidden by a filter keep their seen/unseen status, so ones the
+    # user has never been offered still show as new on a later unfiltered run.
+    previously_known = set(state_entry.get("known", [])) & set(endpoint_ids)
+    known_ids = sorted(previously_known | set(model_ids))
+
     # Model selection
     if args.all:
         selected = model_ids
@@ -1411,7 +1416,7 @@ def main() -> None:
         print(json.dumps(models_config, indent=2))
         state[endpoint] = {
             "selected": sorted(selected),
-            "known": sorted(endpoint_ids),
+            "known": known_ids,
         }
         save_state(state)
         return
@@ -1450,7 +1455,7 @@ def main() -> None:
     if updated:
         state[endpoint] = {
             "selected": sorted(selected),
-            "known": sorted(endpoint_ids),
+            "known": known_ids,
         }
         save_state(state)
 

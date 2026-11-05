@@ -160,10 +160,42 @@ def test_only_free_does_not_add_unconfigured_paid_models(run_tool):
     assert "paid/other" not in run_tool("--only-free", "--all", "--yes")
 
 
-def test_only_free_saves_full_endpoint_list_as_known(run_tool):
+def test_only_free_keeps_previously_known_models_in_state(run_tool):
+    tool.save_state({ENDPOINT: {"known": ["paid/other", "removed/model"]}})
     run_tool("--only-free", "--all", "--yes")
     state = json.loads(tool.state_path().read_text())
     assert state[ENDPOINT]["known"] == ["free/one", "paid/configured", "paid/other"]
+
+
+def test_only_free_does_not_mark_unseen_models_as_known(run_tool):
+    run_tool("--only-free", "--all", "--yes")
+    state = json.loads(tool.state_path().read_text())
+    assert state[ENDPOINT]["known"] == ["free/one", "paid/configured"]
+
+
+def test_only_free_interactive_offers_configured_paid_models(run_tool, monkeypatch):
+    captured = {}
+
+    class FakeApp:
+        def __init__(
+            self, selections, _config_ids, gone_configured, gone_other, *_, **__
+        ):
+            captured["offered"] = {s.value for s in selections}
+            captured["checked"] = {s.value for s in selections if s.initial_state}
+            captured["gone"] = gone_configured + gone_other
+
+        def run(self):
+            return sorted(captured["checked"])
+
+    monkeypatch.setattr(tool, "ModelSelectorApp", FakeApp)
+    tool.save_state({ENDPOINT: {"known": ["paid/other"]}})
+
+    models = run_tool("--only-free", "--yes")
+
+    assert captured["offered"] == {"free/one", "paid/configured"}
+    assert captured["checked"] == {"paid/configured"}
+    assert captured["gone"] == []
+    assert set(models) == {"paid/configured"}
 
 
 def test_only_free_list_shows_free_models_only(run_tool, capsys):
