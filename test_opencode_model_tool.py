@@ -162,6 +162,37 @@ def test_only_free_keeps_configured_paid_models(run_tool):
     assert models["paid/configured"] == CONFIGURED_PAID_ENTRY
 
 
+def test_only_free_keeps_empty_configured_entry(run_tool, tmp_path):
+    config_path = tmp_path / "opencode.json"
+    config = json.loads(config_path.read_text())
+    config["provider"]["fake"]["models"]["paid/configured"] = {}
+    config_path.write_text(json.dumps(config, indent=2))
+
+    assert run_tool("--only-free", "--all", "--yes")["paid/configured"] == {}
+
+
+def test_only_free_without_free_models_keeps_configured(run_tool, monkeypatch):
+    monkeypatch.setattr(tool, "fetch_models", lambda *a, **k: RAW_MODELS[:2])
+    models = run_tool("--only-free", "--all", "--yes")
+    assert models == {"paid/configured": CONFIGURED_PAID_ENTRY}
+
+
+@pytest.mark.parametrize(
+    ("raw_models", "flags"),
+    [
+        (RAW_MODELS[1:2], ("--all", "--yes")),
+        (RAW_MODELS[:2], ("--list",)),
+    ],
+)
+def test_only_free_exits_when_nothing_is_eligible(
+    run_tool, monkeypatch, raw_models, flags
+):
+    monkeypatch.setattr(tool, "fetch_models", lambda *a, **k: raw_models)
+    with pytest.raises(SystemExit) as exc:
+        run_tool("--only-free", *flags)
+    assert exc.value.code == 1
+
+
 def test_format_models_json_layout():
     entry = {"name": "a", "limit": {"context": 1, "output": 2}}
     assert tool.format_models_json({"a": entry, "b": {"name": "b"}}) == (

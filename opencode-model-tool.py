@@ -1225,7 +1225,8 @@ def main() -> None:
         model_ids = [mid for mid in endpoint_ids if mid in free_ids]
         print(f"Filtered to {len(model_ids)} free model(s).")
 
-    if not model_ids:
+    # Non-list --only-free runs check later, once configured models are restored
+    if not model_ids and (args.list_only or not args.only_free):
         print("No eligible models after filtering.")
         sys.exit(1)
 
@@ -1286,6 +1287,9 @@ def main() -> None:
             if mid in config_model_ids and mid not in free_ids
         }
         model_ids = [mid for mid in endpoint_ids if mid in free_ids or mid in preserved]
+        if not model_ids:
+            print("No eligible models after filtering.")
+            sys.exit(1)
 
     # Load state
     state = load_state()
@@ -1411,9 +1415,12 @@ def main() -> None:
     # Build model configs
     models_config = {}
     for mid in selected:
-        models_config[mid] = preserved.get(mid) or build_model_config(
-            mid, args.default_output, api_contexts.get(mid), api_outputs.get(mid)
-        )
+        if mid in preserved:
+            models_config[mid] = preserved[mid]
+        else:
+            models_config[mid] = build_model_config(
+                mid, args.default_output, api_contexts.get(mid), api_outputs.get(mid)
+            )
 
     if config_path is None:
         print("\nNo OpenCode config file found.")
